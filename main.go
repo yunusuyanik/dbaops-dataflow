@@ -455,10 +455,24 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	columns := make([]string, 0)
+	// Ensure PrimaryKeyColumn is first
+	pkFound := false
 	for _, col := range sourceCols {
-		if !excludeMap[strings.ToLower(col)] {
+		if strings.EqualFold(col, mapping.PrimaryKeyColumn) {
+			columns = append(columns, col)
+			pkFound = true
+			break
+		}
+	}
+	// Add other columns (excluding timestamp, identity, and already added PK)
+	for _, col := range sourceCols {
+		if !excludeMap[strings.ToLower(col)] && !strings.EqualFold(col, mapping.PrimaryKeyColumn) {
 			columns = append(columns, col)
 		}
+	}
+	if !pkFound {
+		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, fmt.Sprintf("Primary key column %s not found in source table", mapping.PrimaryKeyColumn))
+		return
 	}
 
 	if len(columns) == 0 {
@@ -482,9 +496,11 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// 2. Prepare temp file
+	// 2. Prepare temp files
 	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("full_sync_%d_%d.dat", mapping.FlowID, mapping.MappingID))
+	formatFile := filepath.Join(os.TempDir(), fmt.Sprintf("full_sync_%d_%d.fmt", mapping.FlowID, mapping.MappingID))
 	defer os.Remove(tmpFile)
+	defer os.Remove(formatFile)
 
 	// 3. Truncate destination table
 	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
@@ -495,7 +511,17 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	// 4. Source to Temp File (bcp queryout) - Native mode
+	// 4. Create format file for destination table
+	log.Printf("Full sync: Creating format file for destination table...")
+	if err := createBCPFormatFile(flow, mapping, formatFile, columns, timestampColumnsDest); err != nil {
+		errorMsg := fmt.Sprintf("Failed to create format file: %v", err)
+		updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+		logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+		return
+	}
+	log.Printf("Full sync: Format file created successfully")
+
+	// 5. Source to Temp File (bcp queryout) - Native mode
 	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
 		strings.ReplaceAll(selectQuery, "\n", " "),
 		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
@@ -513,14 +539,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 	log.Printf("Full sync: Export completed successfully")
 
-	// 5. Temp File to Destination (bcp in) - Native mode
-	// Timestamp columns are already excluded from SELECT, so they'll be NULL in destination
-	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
+	// 6. Temp File to Destination (bcp in) - Using format file
+	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -f "%s" -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable,
-		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
+		tmpFile, formatFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
 
-	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
-		mapping.DestSchema, mapping.DestTable, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
+	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -f "%s" -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
+		mapping.DestSchema, mapping.DestTable, tmpFile, formatFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
 	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
 
 	cmdIn := exec.Command("sh", "-c", bcpInCmd)
@@ -1380,6 +1405,95 @@ func updateLastProcessedPK(statusID int64, pkValue string) {
 
 func updateLastLSN(mappingID int, lsn string) {
 	configDB.Exec("UPDATE table_mappings SET last_cdc_lsn = @p1 WHERE mapping_id = @p2", lsn, mappingID)
+}
+
+func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sourceColumns []string, timestampColumns []string) error {
+	// Step 1: Generate base format file using BCP
+	baseFormatFile := formatFile + ".base"
+	bcpFormatCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" format nul -n -f "%s" -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
+		baseFormatFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase)
+
+	cmd := exec.Command("sh", "-c", bcpFormatCmd)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		os.Remove(baseFormatFile)
+		return fmt.Errorf("failed to generate base format file: %v, output: %s", err, string(output))
+	}
+	defer os.Remove(baseFormatFile)
+
+	// Step 2: Read base format file
+	content, err := os.ReadFile(baseFormatFile)
+	if err != nil {
+		return fmt.Errorf("failed to read base format file: %w", err)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	if len(lines) < 3 {
+		return fmt.Errorf("invalid format file structure")
+	}
+
+	// Step 3: Get destination table columns in order
+	destDB, err := connectToServer(mapping.DestConnString)
+	if err != nil {
+		return fmt.Errorf("failed to connect to destination: %w", err)
+	}
+	defer destDB.Close()
+
+	// Create map of timestamp columns
+	timestampMap := make(map[string]bool)
+	for _, col := range timestampColumns {
+		timestampMap[strings.ToLower(col)] = true
+	}
+
+	// Create map of source columns (for matching)
+	sourceColMap := make(map[string]int)
+	for i, col := range sourceColumns {
+		sourceColMap[strings.ToLower(col)] = i + 1
+	}
+
+	// Step 4: Modify format file - set Server Column Order to 0 for timestamp columns
+	// Format file structure: version, field count, then one line per field
+	// Field line format: Field# SQLType PrefixLength Length Terminator ServerColumnOrder ColumnName Collation
+	modifiedLines := make([]string, 0, len(lines))
+	modifiedLines = append(modifiedLines, lines[0]) // Version
+	modifiedLines = append(modifiedLines, lines[1]) // Field count
+
+	for i := 2; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		parts := strings.Split(line, "\t")
+		if len(parts) < 7 {
+			modifiedLines = append(modifiedLines, line)
+			continue
+		}
+
+		colName := strings.Trim(parts[6], "\"")
+		colNameLower := strings.ToLower(colName)
+
+		// If it's a timestamp column, set Server Column Order to 0 (skip)
+		if timestampMap[colNameLower] {
+			parts[5] = "0"
+			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
+		} else if sourceColMap[colNameLower] > 0 {
+			// Map to source column order
+			parts[5] = fmt.Sprintf("%d", sourceColMap[colNameLower])
+			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
+		} else {
+			// Column not in source, skip it
+			parts[5] = "0"
+			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
+		}
+	}
+
+	// Step 5: Write modified format file
+	if err := os.WriteFile(formatFile, []byte(strings.Join(modifiedLines, "\n")), 0644); err != nil {
+		return fmt.Errorf("failed to write format file: %w", err)
+	}
+
+	return nil
 }
 
 func updateLastFullSync(mappingID int) {
