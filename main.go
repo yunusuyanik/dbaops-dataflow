@@ -420,11 +420,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	recordsProcessed := int64(0)
 	recordsFailed := int64(0)
 
-	timestampColumnsDest, err := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
-	if err != nil {
-		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get timestamp columns from dest: %v", err), "FULL_SYNC", 0, 0)
-	}
-
 	identityColumns, err := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	if err != nil {
 		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get identity columns: %v", err), "FULL_SYNC", 0, 0)
@@ -486,11 +481,9 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// 2. Prepare temp files
+	// 2. Prepare temp file (no format file needed)
 	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("full_sync_%d_%d.dat", mapping.FlowID, mapping.MappingID))
-	formatFile := filepath.Join(os.TempDir(), fmt.Sprintf("full_sync_%d_%d.fmt", mapping.FlowID, mapping.MappingID))
 	defer os.Remove(tmpFile)
-	defer os.Remove(formatFile)
 
 	// 3. Truncate destination table
 	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
@@ -501,17 +494,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	// 4. Create format file for destination table
-	log.Printf("Full sync: Creating format file for destination table...")
-	if err := createBCPFormatFile(flow, mapping, formatFile, columns, timestampColumnsDest); err != nil {
-		errorMsg := fmt.Sprintf("Failed to create format file: %v", err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
-		logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
-		return
-	}
-	log.Printf("Full sync: Format file created successfully")
-
-	// 5. Source to Temp File (bcp queryout) - Native mode
+	// 4. Source to Temp File (bcp queryout) - Native mode
 	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
 		strings.ReplaceAll(selectQuery, "\n", " "),
 		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
@@ -534,13 +517,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	log.Printf("Full sync: Export completed successfully - %d rows exported", exportRows)
 	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP export completed: %d rows", exportRows), "FULL_SYNC", exportRows, 0)
 
-	// 6. Temp File to Destination (bcp in) - Using format file
-	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -f "%s" -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
+	// 5. Temp File to Destination (bcp in) - Native mode, no format file
+	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable,
-		tmpFile, formatFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
+		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
 
-	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -f "%s" -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
-		mapping.DestSchema, mapping.DestTable, tmpFile, formatFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
+	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
+		mapping.DestSchema, mapping.DestTable, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
 	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
 
 	cmdIn := exec.Command("sh", "-c", bcpInCmd)
