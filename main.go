@@ -806,7 +806,7 @@ func executeBatchInsert(db *sql.DB, query string, columns []string, batch [][]in
 	}
 	defer tx.Rollback()
 
-	for _, row := range batch {
+	for rowIdx, row := range batch {
 		args := make([]interface{}, len(row))
 		for i, val := range row {
 			if val == nil {
@@ -821,6 +821,10 @@ func executeBatchInsert(db *sql.DB, query string, columns []string, batch [][]in
 			}
 		}
 		if _, err := tx.Exec(query, args...); err != nil {
+			if rowIdx == 0 {
+				log.Printf("First row insert failed. Column types: %v", getColumnTypes(row))
+				log.Printf("First row sample values (first 5): %v", getSampleValues(row, 5))
+			}
 			return fmt.Errorf("row insert failed: %w", err)
 		}
 	}
