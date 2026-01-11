@@ -825,7 +825,7 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 	user := extractUser(connStr)
 	password := extractPassword(connStr)
 
-	bcpCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -c -t"\t" -S "%s" -U "%s" -P "%s" -d "%s" -b 1000`,
+	bcpCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -c -t"\t" -S "%s" -U "%s" -P "%s" -d "%s" -b 1000 -u`,
 		schema, table, tmpFile, server, user, password, database)
 
 	log.Printf("Executing BCP: bcp \"[%s].[%s]\" in ... -S \"%s\" -U \"%s\" -d \"%s\"", schema, table, server, user, database)
