@@ -743,29 +743,37 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 		return true
 	}
 
-	// Get timestamp columns from both source and dest to exclude from validation
+	// Get timestamp and identity columns from both source and dest to exclude from validation
 	timestampColsSource, _ := getTimestampColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	timestampColsDest, _ := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	identityColsSource, _ := getIdentityColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
+	identityColsDest, _ := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	
-	timestampMap := make(map[string]bool)
+	excludeMap := make(map[string]bool)
 	for _, col := range timestampColsSource {
-		timestampMap[strings.ToLower(col)] = true
+		excludeMap[strings.ToLower(col)] = true
 	}
 	for _, col := range timestampColsDest {
-		timestampMap[strings.ToLower(col)] = true
+		excludeMap[strings.ToLower(col)] = true
+	}
+	for _, col := range identityColsSource {
+		excludeMap[strings.ToLower(col)] = true
+	}
+	for _, col := range identityColsDest {
+		excludeMap[strings.ToLower(col)] = true
 	}
 
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
-		if !timestampMap[strings.ToLower(col)] {
+		if !excludeMap[strings.ToLower(col)] {
 			sourceColMap[strings.ToLower(col)] = true
 		}
 	}
 
 	for _, col := range destCols {
 		colLower := strings.ToLower(col)
-		if timestampMap[colLower] {
-			continue // Skip timestamp columns in validation
+		if excludeMap[colLower] {
+			continue // Skip timestamp and identity columns in validation
 		}
 		if !sourceColMap[colLower] {
 			return false
@@ -1516,11 +1524,11 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 			parts[5] = "0"
 			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
 		} else if sourceColMap[colNameLower] > 0 {
-			// Map to source column order
+			// Map to source column order (1-based)
 			parts[5] = fmt.Sprintf("%d", sourceColMap[colNameLower])
 			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
 		} else {
-			// Column not in source, skip it
+			// Column not in source SELECT, skip it
 			parts[5] = "0"
 			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
 		}
