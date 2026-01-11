@@ -259,25 +259,30 @@ WHERE source_object_id = OBJECT_ID('dbo.Users');
 
 ### Trigger Full Sync
 
-To perform a full sync, set the trigger column to 1 in the source table:
+To perform a full sync, set the trigger column to 1 in the source table. The service checks if any row has the trigger column set to 1, and if found, performs a full sync of the entire table:
 
 ```sql
 -- On SOURCE SQL Server
 USE ProductionDB;
 GO
 
+-- Set trigger column to 1 (any row is sufficient, service checks for existence of 1)
 UPDATE [dbo].[Users]
 SET FullSyncTrigger = 1
-WHERE UserID = 1;  -- or for entire table: WHERE 1=1
+WHERE 1=1;  -- Updates all rows, or use WHERE UserID = 1 for a single row
+GO
 ```
 
+**Note:** The service only checks if the trigger column has any value of 1. It doesn't matter which row(s) have it set to 1. After full sync completes, the service automatically resets all rows with trigger = 1 back to 0.
+
 The service will automatically:
-1. Perform schema validation
-2. Truncate destination table
-3. Fetch all data from source
-4. Insert into destination in batches
-5. Reset trigger column to 0
-6. Continue with CDC for incremental updates
+1. Detect trigger column = 1 (checks if any row has it)
+2. Perform schema validation
+3. Truncate destination table
+4. Fetch all data from source (entire table)
+5. Insert into destination in batches
+6. Reset all trigger columns to 0 (WHERE trigger = 1)
+7. Continue with CDC for incremental updates
 
 ### Stop Flow/Table Sync
 
