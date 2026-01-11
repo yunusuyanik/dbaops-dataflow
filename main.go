@@ -1342,3 +1342,43 @@ func getEnv(key, defaultValue string) string {
 	}
 	return defaultValue
 }
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func getColumnTypes(row []interface{}) []string {
+	types := make([]string, len(row))
+	for i, val := range row {
+		if val == nil {
+			types[i] = "nil"
+		} else {
+			types[i] = fmt.Sprintf("%T", val)
+		}
+	}
+	return types
+}
+
+func getSampleValues(row []interface{}, count int) []interface{} {
+	if len(row) < count {
+		count = len(row)
+	}
+	sample := make([]interface{}, count)
+	for i := 0; i < count; i++ {
+		if row[i] == nil {
+			sample[i] = nil
+		} else if b, ok := row[i].([]byte); ok {
+			if len(b) <= 20 {
+				sample[i] = fmt.Sprintf("[]byte(len=%d)", len(b))
+			} else {
+				sample[i] = fmt.Sprintf("[]byte(len=%d, first10=%x)", len(b), b[:10])
+			}
+		} else {
+			sample[i] = row[i]
+		}
+	}
+	return sample
+}
