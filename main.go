@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"database/sql"
 	"encoding/hex"
@@ -210,6 +211,17 @@ func configReloader() {
 func syncLoop() {
 	defer wg.Done()
 
+	// Panic recovery for the entire loop
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in syncLoop recovered: %v", r)
+			// Restart the loop after a delay
+			time.Sleep(5 * time.Second)
+			wg.Add(1)
+			go syncLoop()
+		}
+	}()
+
 	configMu.RLock()
 	interval := cdcInterval
 	configMu.RUnlock()
@@ -222,7 +234,15 @@ func syncLoop() {
 		case <-stopChan:
 			return
 		case <-ticker.C:
-			processAllMappings()
+			// Panic recovery for each iteration
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC in processAllMappings recovered: %v", r)
+					}
+				}()
+				processAllMappings()
+			}()
 			
 			configMu.RLock()
 			newInterval := cdcInterval
@@ -239,6 +259,17 @@ func syncLoop() {
 func verificationLoop() {
 	defer wg.Done()
 
+	// Panic recovery for the entire loop
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in verificationLoop recovered: %v", r)
+			// Restart the loop after a delay
+			time.Sleep(5 * time.Second)
+			wg.Add(1)
+			go verificationLoop()
+		}
+	}()
+
 	configMu.RLock()
 	interval := verificationInterval
 	configMu.RUnlock()
@@ -251,7 +282,15 @@ func verificationLoop() {
 		case <-stopChan:
 			return
 		case <-ticker.C:
-			performAllVerifications()
+			// Panic recovery for each iteration
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("PANIC in performAllVerifications recovered: %v", r)
+					}
+				}()
+				performAllVerifications()
+			}()
 			
 			configMu.RLock()
 			newInterval := verificationInterval
@@ -306,6 +345,18 @@ func processAllMappings() {
 }
 
 func processMapping(mapping TableMapping) {
+	// Panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in processMapping (mapping_id=%d) recovered: %v", mapping.MappingID, r)
+			logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
+				fmt.Sprintf("Panic recovered: %v", r), nil)
+		}
+		syncingMu.Lock()
+		delete(syncingMappings, mapping.MappingID)
+		syncingMu.Unlock()
+	}()
+
 	syncingMu.Lock()
 	if syncingMappings[mapping.MappingID] {
 		syncingMu.Unlock()
@@ -313,12 +364,6 @@ func processMapping(mapping TableMapping) {
 	}
 	syncingMappings[mapping.MappingID] = true
 	syncingMu.Unlock()
-
-	defer func() {
-		syncingMu.Lock()
-		delete(syncingMappings, mapping.MappingID)
-		syncingMu.Unlock()
-	}()
 
 	sourceDB, err := connectToServer(mapping.SourceConnString)
 	if err != nil {
@@ -387,6 +432,15 @@ func needsFullSync(mapping TableMapping) bool {
 }
 
 func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
+	// Panic recovery for full sync
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in performFullSync (mapping_id=%d) recovered: %v", mapping.MappingID, r)
+			logError(&mapping.MappingID, &mapping.FlowID, "FULL_SYNC",
+				fmt.Sprintf("Panic recovered: %v", r), nil)
+		}
+	}()
+
 	statusID := startSyncStatus(mapping.MappingID, "FULL_SYNC", "RUNNING")
 	if statusID == 0 {
 		return
@@ -504,12 +558,22 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		strings.ReplaceAll(selectQuery, "\n", " "), tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, mapping.SourceDatabase)
 	log.Printf("Full sync: Exporting data... Command: %s", bcpOutLog)
 
-	cmdOut := exec.Command("sh", "-c", bcpOutCmd)
+	// Set timeout for BCP export (2 hours max)
+	ctxOut, cancelOut := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancelOut()
+	cmdOut := exec.CommandContext(ctxOut, "sh", "-c", bcpOutCmd)
+	
 	outputOut, err := cmdOut.CombinedOutput()
 	outputOutStr := string(outputOut)
 	if err != nil {
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr))
-		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr), "FULL_SYNC", 0, 0)
+		if ctxOut.Err() == context.DeadlineExceeded {
+			errorMsg := "BCP export timeout after 2 hours"
+			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+		} else {
+			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr))
+			logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr), "FULL_SYNC", 0, 0)
+		}
 		return
 	}
 	
@@ -527,13 +591,23 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		mapping.DestSchema, mapping.DestTable, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
 	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
 
-	cmdIn := exec.Command("sh", "-c", bcpInCmd)
+	// Set timeout for BCP import (2 hours max)
+	ctxIn, cancelIn := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancelIn()
+	cmdIn := exec.CommandContext(ctxIn, "sh", "-c", bcpInCmd)
+	
 	outputIn, err := cmdIn.CombinedOutput()
 	outputInStr := string(outputIn)
 	if err != nil {
-		errorMsg := fmt.Sprintf("BCP import failed: %v, output: %s", err, outputInStr)
-		updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
-		logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+		if ctxIn.Err() == context.DeadlineExceeded {
+			errorMsg := "BCP import timeout after 2 hours"
+			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+		} else {
+			errorMsg := fmt.Sprintf("BCP import failed: %v, output: %s", err, outputInStr)
+			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+		}
 		return
 	}
 	
@@ -561,6 +635,15 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 }
 
 func processCDC(mapping TableMapping, sourceDB *sql.DB) {
+	// Panic recovery for CDC processing
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in processCDC (mapping_id=%d) recovered: %v", mapping.MappingID, r)
+			logError(&mapping.MappingID, &mapping.FlowID, "CDC",
+				fmt.Sprintf("Panic recovered: %v", r), nil)
+		}
+	}()
+
 	if !isCDCEnabled(mapping, sourceDB) {
 		logSync(mapping.MappingID, "WARNING", "CDC not enabled on source table", "CDC", 0, 0)
 		return
@@ -1136,6 +1219,15 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 }
 
 func performVerification(mapping TableMapping, sourceDB *sql.DB) {
+	// Panic recovery for verification
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in performVerification (mapping_id=%d) recovered: %v", mapping.MappingID, r)
+			logError(&mapping.MappingID, nil, "VERIFICATION",
+				fmt.Sprintf("Panic recovered: %v", r), nil)
+		}
+	}()
+
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		return
