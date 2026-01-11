@@ -726,13 +726,31 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 		return true
 	}
 
+	// Get timestamp columns from both source and dest to exclude from validation
+	timestampColsSource, _ := getTimestampColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
+	timestampColsDest, _ := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	
+	timestampMap := make(map[string]bool)
+	for _, col := range timestampColsSource {
+		timestampMap[strings.ToLower(col)] = true
+	}
+	for _, col := range timestampColsDest {
+		timestampMap[strings.ToLower(col)] = true
+	}
+
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
-		sourceColMap[strings.ToLower(col)] = true
+		if !timestampMap[strings.ToLower(col)] {
+			sourceColMap[strings.ToLower(col)] = true
+		}
 	}
 
 	for _, col := range destCols {
-		if !sourceColMap[strings.ToLower(col)] {
+		colLower := strings.ToLower(col)
+		if timestampMap[colLower] {
+			continue // Skip timestamp columns in validation
+		}
+		if !sourceColMap[colLower] {
 			return false
 		}
 	}
@@ -1410,8 +1428,8 @@ func updateLastLSN(mappingID int, lsn string) {
 func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sourceColumns []string, timestampColumns []string) error {
 	// Step 1: Generate base format file using BCP
 	baseFormatFile := formatFile + ".base"
-	bcpFormatCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" format nul -n -f "%s" -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
-		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
+	bcpFormatCmd := fmt.Sprintf(`bcp "[%s].[%s]" format nul -n -f "%s" -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
+		mapping.DestSchema, mapping.DestTable,
 		baseFormatFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase)
 
 	cmd := exec.Command("sh", "-c", bcpFormatCmd)
