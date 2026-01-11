@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -489,7 +491,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		recordsProcessed++
 
 		if len(batch) >= batchSizeLocal {
-			if err := executeBatchInsert(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
+			if err := executeBatchInsert(destDB, mapping.DestConnString, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
 				recordsFailed += int64(len(batch))
 				logSync(mapping.MappingID, "ERROR",
 					fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
@@ -499,7 +501,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	if len(batch) > 0 {
-		if err := executeBatchInsert(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
+		if err := executeBatchInsert(destDB, mapping.DestConnString, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
 			recordsFailed += int64(len(batch))
 			logSync(mapping.MappingID, "ERROR",
 				fmt.Sprintf("Final batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
@@ -781,76 +783,89 @@ func getTableColumns(db *sql.DB, database, schema, table string) ([]string, erro
 	return columns, nil
 }
 
-func executeBatchInsert(db *sql.DB, database, schema, table string, columns []string, batch [][]interface{}) error {
+func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, columns []string, batch [][]interface{}) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
-	tx, err := db.Begin()
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("bcp_bulk_%d.dat", time.Now().UnixNano()))
+	defer os.Remove(tmpFile)
+
+	file, err := os.Create(tmpFile)
 	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	tempTableName := fmt.Sprintf("#temp_bulk_%d", time.Now().UnixNano())
-	
-	columnDefs, err := getColumnDefinitions(db, database, schema, table, columns)
-	if err != nil {
-		return fmt.Errorf("failed to get column definitions: %w", err)
-	}
-	
-	createTempTableQuery := fmt.Sprintf(`
-		CREATE TABLE %s (
-			%s
-		)
-	`, tempTableName, strings.Join(columnDefs, ", "))
-
-	if _, err := tx.Exec(createTempTableQuery); err != nil {
-		return fmt.Errorf("failed to create temp table: %w", err)
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 
-	insertTempQuery := fmt.Sprintf(`
-		INSERT INTO %s (%s) VALUES %s
-	`, tempTableName, strings.Join(columns, ", "), buildValuesClause(len(columns), len(batch)))
-
-	args := make([]interface{}, 0, len(columns)*len(batch))
 	for _, row := range batch {
+		values := make([]string, len(row))
 		for i, val := range row {
 			if val == nil {
-				args = append(args, nil)
+				values[i] = ""
 			} else {
 				switch v := val.(type) {
 				case []byte:
-					args = append(args, v)
+					values[i] = fmt.Sprintf("0x%x", v)
+				case string:
+					escaped := strings.ReplaceAll(v, "\t", " ")
+					escaped = strings.ReplaceAll(escaped, "\n", " ")
+					escaped = strings.ReplaceAll(escaped, "\r", " ")
+					values[i] = escaped
 				default:
-					args = append(args, val)
+					values[i] = fmt.Sprintf("%v", v)
 				}
 			}
-			_ = i
+		}
+		if _, err := file.WriteString(strings.Join(values, "\t") + "\n"); err != nil {
+			file.Close()
+			return fmt.Errorf("failed to write to temp file: %w", err)
 		}
 	}
+	file.Close()
 
-	if _, err := tx.Exec(insertTempQuery, args...); err != nil {
-		return fmt.Errorf("failed to insert into temp table: %w", err)
+	server := extractServer(connStr)
+	user := extractUser(connStr)
+	password := extractPassword(connStr)
+
+	bcpCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -c -t"\t" -S %s -U %s -P %s -d %s`,
+		database, schema, table, tmpFile, server, user, password, database)
+
+	cmd := exec.Command("sh", "-c", bcpCmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("BCP failed: %v, output: %s", err, string(output))
 	}
 
-	bulkInsertQuery := fmt.Sprintf(`
-		INSERT INTO [%s].[%s].[%s] (%s)
-		SELECT %s FROM %s
-	`, database, schema, table,
-		strings.Join(columns, ", "),
-		strings.Join(columns, ", "),
-		tempTableName)
+	return nil
+}
 
-	if _, err := tx.Exec(bulkInsertQuery); err != nil {
-		return fmt.Errorf("failed to bulk insert: %w", err)
+func extractServer(connStr string) string {
+	parts := strings.Split(connStr, ";")
+	for _, part := range parts {
+		if strings.HasPrefix(part, "server=") {
+			return strings.TrimPrefix(part, "server=")
+		}
 	}
+	return "localhost"
+}
 
-	if _, err := tx.Exec(fmt.Sprintf("DROP TABLE %s", tempTableName)); err != nil {
-		log.Printf("Warning: failed to drop temp table: %v", err)
+func extractUser(connStr string) string {
+	parts := strings.Split(connStr, ";")
+	for _, part := range parts {
+		if strings.HasPrefix(part, "user id=") {
+			return strings.TrimPrefix(part, "user id=")
+		}
 	}
+	return "sa"
+}
 
-	return tx.Commit()
+func extractPassword(connStr string) string {
+	parts := strings.Split(connStr, ";")
+	for _, part := range parts {
+		if strings.HasPrefix(part, "password=") {
+			return strings.TrimPrefix(part, "password=")
+		}
+	}
+	return ""
 }
 
 func getColumnDefinitions(db *sql.DB, database, schema, table string, columns []string) ([]string, error) {
