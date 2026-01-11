@@ -28,6 +28,10 @@ var (
 	batchSize       = 1000
 	maxRetryAttempts = 3
 	retryDelay      = 30 * time.Second
+
+	// In-progress tracking
+	syncingMappings = make(map[int]bool)
+	syncingMu       sync.Mutex
 )
 
 // Flow represents source-dest connection details
@@ -301,6 +305,20 @@ func processAllMappings() {
 }
 
 func processMapping(mapping TableMapping) {
+	syncingMu.Lock()
+	if syncingMappings[mapping.MappingID] {
+		syncingMu.Unlock()
+		return
+	}
+	syncingMappings[mapping.MappingID] = true
+	syncingMu.Unlock()
+
+	defer func() {
+		syncingMu.Lock()
+		delete(syncingMappings, mapping.MappingID)
+		syncingMu.Unlock()
+	}()
+
 	sourceDB, err := connectToServer(mapping.SourceConnString)
 	if err != nil {
 		logError(&mapping.MappingID, &mapping.FlowID, "CONNECTION",
@@ -454,6 +472,9 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	`, strings.Join(columns, ", "),
 		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, mapping.PrimaryKeyColumn)
 
+	// Mark as processing immediately to prevent re-triggering
+	configDB.Exec("UPDATE table_mappings SET is_full_sync = 0 WHERE mapping_id = @p1", mapping.MappingID)
+
 	// 1. Get flow details for BCP
 	flow, err := getFlowByID(mapping.FlowID)
 	if err != nil {
@@ -527,11 +548,10 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	// Update flags
-	configDB.Exec("UPDATE table_mappings SET is_full_sync = 0 WHERE mapping_id = @p1", mapping.MappingID)
 	updateLastFullSync(mapping.MappingID)
 
 	duration := time.Since(startTime)
-	updateSyncStatus(statusID, "COMPLETED", 0, 0, "") // BCP doesn't easily give row counts here without parsing
+	updateSyncStatus(statusID, "COMPLETED", 0, 0, "")
 
 	logSync(mapping.MappingID, "INFO",
 		fmt.Sprintf("Full sync completed via BCP-to-BCP, duration: %v", duration),
