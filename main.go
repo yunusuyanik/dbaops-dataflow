@@ -400,10 +400,31 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 	defer rows.Close()
 
-	columns, err := rows.Columns()
+	allColumns, err := rows.Columns()
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
 		return
+	}
+
+	timestampColumns, err := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	if err != nil {
+		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get timestamp columns: %v", err), "FULL_SYNC", 0, 0)
+	}
+
+	timestampMap := make(map[string]bool)
+	for _, col := range timestampColumns {
+		timestampMap[strings.ToLower(col)] = true
+	}
+
+	columns := make([]string, 0)
+	columnIndexMap := make(map[int]int)
+	colIdx := 0
+	for i, col := range allColumns {
+		if !timestampMap[strings.ToLower(col)] {
+			columns = append(columns, col)
+			columnIndexMap[colIdx] = i
+			colIdx++
+		}
 	}
 
 	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
@@ -663,6 +684,33 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 	return true
 }
 
+func getTimestampColumns(db *sql.DB, database, schema, table string) ([]string, error) {
+	query := fmt.Sprintf(`
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_CATALOG = '%s'
+		AND TABLE_SCHEMA = '%s'
+		AND TABLE_NAME = '%s'
+		AND DATA_TYPE IN ('timestamp', 'rowversion')
+	`, database, schema, table)
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, err
+		}
+		columns = append(columns, col)
+	}
+	return columns, nil
+}
+
 func getTableColumns(db *sql.DB, database, schema, table string) ([]string, error) {
 	query := fmt.Sprintf(`
 		SELECT COLUMN_NAME 
@@ -807,8 +855,13 @@ func applyDelete(db *sql.DB, mapping TableMapping, change map[string]interface{}
 
 func isCDCEnabled(mapping TableMapping, db *sql.DB) bool {
 	var isCDCEnabled int
-	db.QueryRow(fmt.Sprintf("SELECT is_cdc_enabled FROM sys.databases WHERE name = '%s'", mapping.SourceDatabase)).Scan(&isCDCEnabled)
+	err := db.QueryRow(fmt.Sprintf("SELECT is_cdc_enabled FROM sys.databases WHERE name = '%s'", mapping.SourceDatabase)).Scan(&isCDCEnabled)
+	if err != nil {
+		log.Printf("Error checking CDC on database: %v", err)
+		return false
+	}
 	if isCDCEnabled == 0 {
+		log.Printf("CDC not enabled on database: %s", mapping.SourceDatabase)
 		return false
 	}
 
@@ -820,9 +873,14 @@ func isCDCEnabled(mapping TableMapping, db *sql.DB) bool {
 
 	var count int
 	if err := db.QueryRow(query).Scan(&count); err != nil {
+		log.Printf("Error checking CDC on table %s.%s.%s: %v", mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, err)
 		return false
 	}
-	return count > 0
+	if count == 0 {
+		log.Printf("CDC not enabled on table: %s.%s.%s", mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
+		return false
+	}
+	return true
 }
 
 func getMinLSN(mapping TableMapping, db *sql.DB) string {
