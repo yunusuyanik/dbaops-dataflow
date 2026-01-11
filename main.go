@@ -483,21 +483,24 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	log.Printf("Full sync: Exporting data from source server %s...", flow.SourceServer)
 	cmdOut := exec.Command("sh", "-c", bcpOutCmd)
 	if output, err := cmdOut.CombinedOutput(); err != nil {
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, string(output)))
-		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v", err), "FULL_SYNC", 0, 0)
+		outputStr := string(output)
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, outputStr))
+		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputStr), "FULL_SYNC", 0, 0)
 		return
 	}
 
 	// 5. Temp File to Destination (bcp in)
-	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
+	// Added -E for identity columns just in case
+	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
 		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
 
 	log.Printf("Full sync: Importing data to destination server %s...", flow.DestServer)
 	cmdIn := exec.Command("sh", "-c", bcpInCmd)
 	if output, err := cmdIn.CombinedOutput(); err != nil {
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP import failed: %v, output: %s", err, string(output)))
-		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP import failed: %v", err), "FULL_SYNC", 0, 0)
+		outputStr := string(output)
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP import failed: %v, output: %s", err, outputStr))
+		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP import failed: %v, output: %s", err, outputStr), "FULL_SYNC", 0, 0)
 		return
 	}
 
