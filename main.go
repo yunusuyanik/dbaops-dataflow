@@ -1246,7 +1246,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		if i >= 1000 {
 			break
 		}
-		pkPlaceholders = append(pkPlaceholders, fmt.Sprintf("@pk%d", i+1))
+		pkPlaceholders = append(pkPlaceholders, fmt.Sprintf("@p%d", i+1))
 		pkArgs = append(pkArgs, pkVal)
 	}
 
