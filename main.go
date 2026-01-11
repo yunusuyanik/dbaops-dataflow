@@ -1119,11 +1119,10 @@ func calculateRowMD5(row map[string]interface{}) string {
 func getEnabledMappings() ([]TableMapping, error) {
 	query := `SELECT 
 		tm.mapping_id, 
-		tm.source_server_id,
+		tm.flow_id,
 		tm.source_database, 
 		tm.source_schema, 
 		tm.source_table,
-		tm.dest_server_id,
 		tm.dest_database, 
 		tm.dest_schema, 
 		tm.dest_table, 
@@ -1133,14 +1132,12 @@ func getEnabledMappings() ([]TableMapping, error) {
 		tm.cdc_enabled, 
 		tm.last_cdc_lsn, 
 		tm.last_full_sync_at,
-		sc_source.connection_string AS source_conn_string,
-		sc_dest.connection_string AS dest_conn_string
+		CONCAT('server=', f.source_server, ';port=', CAST(f.source_port AS NVARCHAR), ';user id=', f.source_user, ';password=', f.source_password, ';encrypt=disable') AS source_conn_string,
+		CONCAT('server=', f.dest_server, ';port=', CAST(f.dest_port AS NVARCHAR), ';user id=', f.dest_user, ';password=', f.dest_password, ';encrypt=disable') AS dest_conn_string
 	FROM table_mappings tm
-	INNER JOIN server_connections sc_source ON tm.source_server_id = sc_source.server_id
-	INNER JOIN server_connections sc_dest ON tm.dest_server_id = sc_dest.server_id
+	INNER JOIN flows f ON tm.flow_id = f.flow_id
 	WHERE tm.is_enabled = 1 
-	AND sc_source.is_enabled = 1 
-	AND sc_dest.is_enabled = 1`
+	AND f.is_enabled = 1`
 	
 	rows, err := configDB.Query(query)
 	if err != nil {
@@ -1151,8 +1148,8 @@ func getEnabledMappings() ([]TableMapping, error) {
 	var mappings []TableMapping
 	for rows.Next() {
 		var m TableMapping
-		if err := rows.Scan(&m.MappingID, &m.SourceServerID, &m.SourceDatabase, &m.SourceSchema, &m.SourceTable,
-			&m.DestServerID, &m.DestDatabase, &m.DestSchema, &m.DestTable, &m.PrimaryKeyColumn,
+		if err := rows.Scan(&m.MappingID, &m.FlowID, &m.SourceDatabase, &m.SourceSchema, &m.SourceTable,
+			&m.DestDatabase, &m.DestSchema, &m.DestTable, &m.PrimaryKeyColumn,
 			&m.FullSyncTriggerCol, &m.IsEnabled, &m.CDCEnabled, &m.LastCDCLSN, &m.LastFullSyncAt,
 			&m.SourceConnString, &m.DestConnString); err != nil {
 			continue
