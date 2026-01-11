@@ -85,7 +85,7 @@ BEGIN
         dest_schema NVARCHAR(255) NOT NULL DEFAULT 'dbo',
         dest_table NVARCHAR(255) NOT NULL,
         primary_key_column NVARCHAR(255) NOT NULL,
-        full_sync_trigger_column NVARCHAR(255) NULL,
+        is_full_sync BIT NOT NULL DEFAULT 0,
         is_enabled BIT NOT NULL DEFAULT 1,
         cdc_enabled BIT NOT NULL DEFAULT 0,
         last_cdc_lsn BINARY(10) NULL,

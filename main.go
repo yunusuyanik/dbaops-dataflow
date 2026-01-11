@@ -39,7 +39,7 @@ type TableMapping struct {
 	DestSchema           string
 	DestTable            string
 	PrimaryKeyColumn     string
-	FullSyncTriggerCol   sql.NullString
+	IsFullSync           bool
 	IsEnabled            bool
 	CDCEnabled           bool
 	LastCDCLSN           sql.NullString
@@ -301,7 +301,7 @@ func processMapping(mapping TableMapping) {
 
 	updateLastConnected(mapping.FlowID)
 
-	if needsFullSync(mapping, sourceDB) {
+	if needsFullSync(mapping) {
 		performFullSync(mapping, sourceDB)
 	} else if mapping.CDCEnabled {
 		processCDC(mapping, sourceDB)
@@ -353,26 +353,8 @@ func performAllVerifications() {
 	wgWorkers.Wait()
 }
 
-func needsFullSync(mapping TableMapping, sourceDB *sql.DB) bool {
-	if !mapping.FullSyncTriggerCol.Valid {
-		return false
-	}
-
-	query := fmt.Sprintf(`
-		SELECT TOP 1 CAST(%s AS INT) 
-		FROM [%s].[%s].[%s]
-		WHERE %s = 1
-	`, mapping.FullSyncTriggerCol.String,
-		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
-		mapping.FullSyncTriggerCol.String)
-
-	var triggerValue int
-	err := sourceDB.QueryRow(query).Scan(&triggerValue)
-	if err != nil {
-		return false
-	}
-
-	return triggerValue == 1
+func needsFullSync(mapping TableMapping) bool {
+	return mapping.IsFullSync
 }
 
 func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
@@ -496,15 +478,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	if mapping.FullSyncTriggerCol.Valid {
-		resetQuery := fmt.Sprintf(`
-			UPDATE [%s].[%s].[%s]
-			SET %s = 0
-			WHERE %s = 1
-		`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
-			mapping.FullSyncTriggerCol.String, mapping.FullSyncTriggerCol.String)
-		sourceDB.Exec(resetQuery)
-	}
+	configDB.Exec("UPDATE table_mappings SET is_full_sync = 0 WHERE mapping_id = @p1", mapping.MappingID)
 
 	updateLastFullSync(mapping.MappingID)
 
@@ -1127,7 +1101,7 @@ func getEnabledMappings() ([]TableMapping, error) {
 		tm.dest_schema, 
 		tm.dest_table, 
 		tm.primary_key_column,
-		tm.full_sync_trigger_column, 
+		tm.is_full_sync,
 		tm.is_enabled, 
 		tm.cdc_enabled, 
 		tm.last_cdc_lsn, 
@@ -1150,7 +1124,7 @@ func getEnabledMappings() ([]TableMapping, error) {
 		var m TableMapping
 		if err := rows.Scan(&m.MappingID, &m.FlowID, &m.SourceDatabase, &m.SourceSchema, &m.SourceTable,
 			&m.DestDatabase, &m.DestSchema, &m.DestTable, &m.PrimaryKeyColumn,
-			&m.FullSyncTriggerCol, &m.IsEnabled, &m.CDCEnabled, &m.LastCDCLSN, &m.LastFullSyncAt,
+			&m.IsFullSync, &m.IsEnabled, &m.CDCEnabled, &m.LastCDCLSN, &m.LastFullSyncAt,
 			&m.SourceConnString, &m.DestConnString); err != nil {
 			continue
 		}
