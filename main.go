@@ -800,19 +800,22 @@ func executeBatchInsert(db *sql.DB, query string, columns []string, batch [][]in
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(query)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
 	for _, row := range batch {
 		args := make([]interface{}, len(row))
 		for i, val := range row {
-			args[i] = val
+			if val == nil {
+				args[i] = nil
+			} else {
+				switch v := val.(type) {
+				case []byte:
+					args[i] = v
+				default:
+					args[i] = val
+				}
+			}
 		}
-		if _, err := stmt.Exec(args...); err != nil {
-			return err
+		if _, err := tx.Exec(query, args...); err != nil {
+			return fmt.Errorf("row insert failed: %w", err)
 		}
 	}
 
