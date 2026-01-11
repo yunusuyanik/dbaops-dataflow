@@ -167,19 +167,15 @@ func getConfigValue(key string) string {
 func main() {
 	log.Println("DBAOps DataFlow starting...")
 
-	// Start config reloader (reload every minute)
 	wg.Add(1)
 	go configReloader()
 
-	// Start main sync loop
 	wg.Add(1)
 	go syncLoop()
 
-	// Start verification loop
 	wg.Add(1)
 	go verificationLoop()
 
-	// Wait for stop signal
 	select {
 	case <-stopChan:
 		log.Println("Stopping DBAOps DataFlow...")
@@ -224,7 +220,6 @@ func syncLoop() {
 		case <-ticker.C:
 			processAllMappings()
 			
-			// Reload interval in case it changed
 			configMu.RLock()
 			newInterval := cdcInterval
 			configMu.RUnlock()
@@ -254,7 +249,6 @@ func verificationLoop() {
 		case <-ticker.C:
 			performAllVerifications()
 			
-			// Reload interval in case it changed
 			configMu.RLock()
 			newInterval := verificationInterval
 			configMu.RUnlock()
@@ -278,21 +272,17 @@ func processAllMappings() {
 		return
 	}
 
-	// Use worker pool pattern for parallel processing
 	configMu.RLock()
 	workers := parallelWorkers
 	configMu.RUnlock()
 
-	// Limit workers to number of mappings
 	if workers > len(mappings) {
 		workers = len(mappings)
 	}
 
-	// Create worker pool
 	jobs := make(chan TableMapping, len(mappings))
 	var wgWorkers sync.WaitGroup
 
-	// Start workers
 	for i := 0; i < workers; i++ {
 		wgWorkers.Add(1)
 		go func() {
@@ -303,18 +293,15 @@ func processAllMappings() {
 		}()
 	}
 
-	// Send jobs
 	for _, mapping := range mappings {
 		jobs <- mapping
 	}
 	close(jobs)
 
-	// Wait for all workers to finish
 	wgWorkers.Wait()
 }
 
 func processMapping(mapping TableMapping) {
-	// Connect to source server
 	sourceDB, err := connectToServer(mapping.SourceConnString)
 	if err != nil {
 		logError(&mapping.MappingID, &mapping.SourceServerID, "CONNECTION",
@@ -323,14 +310,11 @@ func processMapping(mapping TableMapping) {
 	}
 	defer sourceDB.Close()
 
-	// Update last connected for source
 	updateLastConnected(mapping.SourceServerID)
 
-	// Check if full sync is needed
 	if needsFullSync(mapping, sourceDB) {
 		performFullSync(mapping, sourceDB)
 	} else if mapping.CDCEnabled {
-		// Process CDC changes
 		processCDC(mapping, sourceDB)
 	}
 }
@@ -346,7 +330,6 @@ func performAllVerifications() {
 		return
 	}
 
-	// Use worker pool for verification
 	configMu.RLock()
 	workers := parallelWorkers
 	configMu.RUnlock()
@@ -411,7 +394,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	logSync(mapping.MappingID, "INFO", "Full sync started", "FULL_SYNC", 0, 0)
 
-	// Schema validation
 	if !validateSchema(mapping, sourceDB) {
 		updateSyncStatus(statusID, "ERROR", 0, 0, "Schema validation failed")
 		logError(&mapping.MappingID, &mapping.SourceServerID, "SCHEMA", "Schema validation failed", nil)
@@ -420,7 +402,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	logSync(mapping.MappingID, "INFO", "Schema validation passed", "SCHEMA_CHECK", 0, 0)
 
-	// Connect to destination server
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
@@ -430,7 +411,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 	defer destDB.Close()
 
-	// Switch to destination database
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
@@ -441,7 +421,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	recordsProcessed := int64(0)
 	recordsFailed := int64(0)
 
-	// Build SELECT query
 	selectQuery := fmt.Sprintf(`
 		SELECT * FROM [%s].[%s].[%s]
 		ORDER BY %s
@@ -462,7 +441,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Truncate dest table (full sync)
 	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	_, err = destDB.Exec(truncateQuery)
@@ -471,7 +449,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	// Build INSERT query
 	placeholders := make([]string, len(columns))
 	for i := range placeholders {
 		placeholders[i] = fmt.Sprintf("@p%d", i+1)
@@ -483,7 +460,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		strings.Join(columns, ", "),
 		strings.Join(placeholders, ", "))
 
-	// Batch insert
 	configMu.RLock()
 	batchSizeLocal := batchSize
 	configMu.RUnlock()
@@ -504,7 +480,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			continue
 		}
 
-		// Get PK value for tracking
 		for i, col := range columns {
 			if strings.EqualFold(col, mapping.PrimaryKeyColumn) {
 				lastPKValue = values[i]
@@ -525,7 +500,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	// Insert remaining batch
 	if len(batch) > 0 {
 		if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
 			recordsFailed += int64(len(batch))
@@ -534,7 +508,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	// Reset trigger column to 0
 	if mapping.FullSyncTriggerCol.Valid {
 		resetQuery := fmt.Sprintf(`
 			UPDATE [%s].[%s].[%s]
@@ -595,7 +568,6 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Connect to destination server
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
@@ -624,7 +596,6 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			}
 		}
 
-		// Get operation type (can be int or string from CDC)
 		var operation int
 		if opVal, ok := change["__$operation"]; ok {
 			switch v := opVal.(type) {
@@ -645,7 +616,6 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		case 2:
 			err = applyInsert(destDB, mapping, change)
 		case 3:
-			// Skip update before
 		case 4:
 			err = applyUpdate(destDB, mapping, change)
 		default:
@@ -840,7 +810,7 @@ func applyUpdate(db *sql.DB, mapping TableMapping, change map[string]interface{}
 
 	pkValue, ok := change[mapping.PrimaryKeyColumn]
 	if !ok {
-		return fmt.Errorf("primary key column %s not found in change", mapping.PrimaryKeyColumn)
+		return fmt.Errorf("primary key column %s not found", mapping.PrimaryKeyColumn)
 	}
 
 	query := fmt.Sprintf(`
@@ -865,7 +835,7 @@ func applyUpdate(db *sql.DB, mapping TableMapping, change map[string]interface{}
 func applyDelete(db *sql.DB, mapping TableMapping, change map[string]interface{}) error {
 	pkValue, ok := change[mapping.PrimaryKeyColumn]
 	if !ok {
-		return fmt.Errorf("primary key column %s not found in change", mapping.PrimaryKeyColumn)
+		return fmt.Errorf("primary key column %s not found", mapping.PrimaryKeyColumn)
 	}
 
 	query := fmt.Sprintf(`
@@ -910,10 +880,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		return ""
 	}
 
-	lsnQuery := fmt.Sprintf(`
-		SELECT MIN(__$start_lsn)
-		FROM cdc.[%s]
-	`, captureInstance.String)
+	lsnQuery := fmt.Sprintf(`SELECT MIN(__$start_lsn) FROM cdc.[%s]`, captureInstance.String)
 
 	var lsn []byte
 	if err := db.QueryRow(lsnQuery).Scan(&lsn); err != nil {
