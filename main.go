@@ -495,12 +495,12 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	// 4. Source to Temp File (bcp queryout) - Character mode
-	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -c -t"\t" -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
+	// 4. Source to Temp File (bcp queryout) - Native mode
+	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
 		strings.ReplaceAll(selectQuery, "\n", " "),
 		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
 
-	bcpOutLog := fmt.Sprintf(`bcp "%s" queryout "%s" -c -t"\t" -S "%s,%d" -U "%s" -P "****" -d "%s" -u`,
+	bcpOutLog := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "****" -d "%s" -u`,
 		strings.ReplaceAll(selectQuery, "\n", " "), tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, mapping.SourceDatabase)
 	log.Printf("Full sync: Exporting data... Command: %s", bcpOutLog)
 
@@ -513,12 +513,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 	log.Printf("Full sync: Export completed successfully")
 
-	// 5. Temp File to Destination (bcp in) - Character mode
-	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -c -t"\t" -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
+	// 5. Temp File to Destination (bcp in) - Native mode
+	// Timestamp columns are already excluded from SELECT, so they'll be NULL in destination
+	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable,
 		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
 
-	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -c -t"\t" -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
+	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
 	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
 
