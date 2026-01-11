@@ -425,23 +425,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get timestamp columns from dest: %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	timestampColumnsSource, err := getTimestampColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	if err != nil {
-		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get timestamp columns from source: %v", err), "FULL_SYNC", 0, 0)
-	}
-
 	identityColumns, err := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	if err != nil {
 		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get identity columns: %v", err), "FULL_SYNC", 0, 0)
 	}
 
+	// Only exclude identity columns from SELECT (timestamp will be included)
 	excludeMap := make(map[string]bool)
-	for _, col := range timestampColumnsDest {
-		excludeMap[strings.ToLower(col)] = true
-	}
-	for _, col := range timestampColumnsSource {
-		excludeMap[strings.ToLower(col)] = true
-	}
 	for _, col := range identityColumns {
 		excludeMap[strings.ToLower(col)] = true
 	}
