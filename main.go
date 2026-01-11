@@ -66,9 +66,8 @@ func init() {
 	configServer := getEnv("CONFIG_SERVER", "localhost")
 	configUser := getEnv("CONFIG_USER", "sa")
 	configPass := getEnv("CONFIG_PASS", "")
-	
 	if configPass == "" {
-		log.Fatal("CONFIG_PASS environment variable required")
+		log.Fatal("CONFIG_PASS environment variable required (only config DB credentials needed, source/dest are in flows table)")
 	}
 
 	connStr := fmt.Sprintf("server=%s;user id=%s;password=%s;database=dbaops_dataflow;encrypt=disable",

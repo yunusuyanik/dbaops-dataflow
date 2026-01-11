@@ -40,6 +40,8 @@ sqlcmd -S SERVER -U sa -P PASSWORD -i schema-dataflow.sql
 
 ### 2. Configure Environment
 
+Only config database credentials are required. Source and destination credentials are stored in `flows` table.
+
 ```bash
 export CONFIG_SERVER=localhost
 export CONFIG_USER=sa
