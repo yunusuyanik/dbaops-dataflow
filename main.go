@@ -466,6 +466,12 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		strings.Join(columns, ", "),
 		strings.Join(placeholders, ", "))
 
+	log.Printf("INSERT Query: INSERT INTO [%s].[%s].[%s] (%s) VALUES (%s)",
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "))
+	log.Printf("Columns count: %d, First 10 columns: %v", len(columns), columns[:min(10, len(columns))])
+
 	configMu.RLock()
 	batchSizeLocal := batchSize
 	configMu.RUnlock()
