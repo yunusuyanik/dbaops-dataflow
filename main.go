@@ -456,12 +456,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		recordsProcessed++
 
 		if len(batch) >= batchSizeLocal {
-		if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
-			recordsFailed += int64(len(batch))
-			logSync(mapping.MappingID, "ERROR",
-				fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
+			if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
+				recordsFailed += int64(len(batch))
+				logSync(mapping.MappingID, "ERROR",
+					fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
+			}
+			batch = batch[:0]
 		}
-		batch = batch[:0]
 	}
 
 	if len(batch) > 0 {
