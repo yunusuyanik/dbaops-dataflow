@@ -17,9 +17,9 @@ Production-grade, minimal CDC (Change Data Capture) and Full Sync service. Trans
 ## Prerequisites
 
 - Go 1.21 or higher
-- SQL Server (destination server)
+- SQL Server (for config database - can be any server)
 - SQL Server with CDC enabled (source servers)
-- Network access between destination and source servers
+- Network access between config, source, and destination servers
 
 ## Installation
 
@@ -38,44 +38,47 @@ go mod download
 
 ### Step 3: Setup Database Schema
 
-Run the schema file on the destination SQL Server:
+Run the schema file on **any SQL Server** (can be source, destination, or a separate config server):
 
 ```bash
-sqlcmd -S DEST_SERVER -U sa -P PASSWORD -i schema-dataflow.sql
+sqlcmd -S CONFIG_SERVER -U sa -P PASSWORD -i schema-dataflow.sql
 ```
 
 Or using SQL Server Management Studio:
 1. Open `schema-dataflow.sql`
-2. Connect to your destination server
+2. Connect to your server (any server works)
 3. Execute the script
 
 This will create:
 - `dbaops_dataflow` database
-- All required tables (source_servers, table_mappings, sync_status, etc.)
+- `config` table (for intervals and parallel count)
+- `server_connections` table (for source and destination servers)
+- `table_mappings` table (with source and dest server references)
+- All required tables (sync_status, sync_logs, error_logs, etc.)
 - Helper views for monitoring
 
 ### Step 4: Configure Environment Variables
 
-Set the following environment variables:
+Set the following environment variables for the **config database** connection:
 
 ```bash
-export DEST_SERVER=localhost
-export DEST_USER=sa
-export DEST_PASS=your-password
+export CONFIG_SERVER=localhost
+export CONFIG_USER=sa
+export CONFIG_PASS=your-password
 ```
 
 For Windows (PowerShell):
 ```powershell
-$env:DEST_SERVER="localhost"
-$env:DEST_USER="sa"
-$env:DEST_PASS="your-password"
+$env:CONFIG_SERVER="localhost"
+$env:CONFIG_USER="sa"
+$env:CONFIG_PASS="your-password"
 ```
 
 For Windows (CMD):
 ```cmd
-set DEST_SERVER=localhost
-set DEST_USER=sa
-set DEST_PASS=your-password
+set CONFIG_SERVER=localhost
+set CONFIG_USER=sa
+set CONFIG_PASS=your-password
 ```
 
 ### Step 5: Build the Application
@@ -101,30 +104,63 @@ The service will start and begin checking for sync operations every 10 seconds.
 
 ## Usage
 
-### Add Source Server
+### Configure Settings
 
-Connect to the destination database and insert a source server:
+Update configuration values in the `config` table:
 
 ```sql
 USE dbaops_dataflow;
 GO
 
-INSERT INTO source_servers (server_name, connection_string, is_enabled)
+-- Update CDC check interval (in seconds)
+UPDATE config SET config_value = '10' WHERE config_key = 'cdc_check_interval_seconds';
+
+-- Update verification interval (in minutes)
+UPDATE config SET config_value = '5' WHERE config_key = 'verification_interval_minutes';
+
+-- Update parallel scheduler count (number of concurrent workers)
+UPDATE config SET config_value = '5' WHERE config_key = 'parallel_scheduler_count';
+
+-- Update batch size
+UPDATE config SET config_value = '1000' WHERE config_key = 'batch_size';
+```
+
+### Add Server Connections
+
+Add both source and destination servers:
+
+```sql
+USE dbaops_dataflow;
+GO
+
+-- Add source server
+INSERT INTO server_connections (server_name, server_type, connection_string, is_enabled)
 VALUES (
     'SourceServer1',
+    'SOURCE',
     'server=source1.example.com;user id=sa;password=pass;database=master;encrypt=disable',
+    1
+);
+
+-- Add destination server
+INSERT INTO server_connections (server_name, server_type, connection_string, is_enabled)
+VALUES (
+    'DestServer1',
+    'DEST',
+    'server=dest1.example.com;user id=sa;password=pass;database=master;encrypt=disable',
     1
 );
 ```
 
 ### Add Table Mapping
 
-Create a mapping between source and destination tables:
+Create a mapping between source and destination tables (both servers must exist):
 
 ```sql
 INSERT INTO table_mappings (
-    server_id,
+    source_server_id,
     source_database, source_schema, source_table,
+    dest_server_id,
     dest_database, dest_schema, dest_table,
     primary_key_column,
     full_sync_trigger_column,
@@ -132,8 +168,9 @@ INSERT INTO table_mappings (
     cdc_enabled
 )
 VALUES (
-    1,
+    1,  -- source_server_id (from server_connections)
     'SourceDB', 'dbo', 'Users',
+    2,  -- dest_server_id (from server_connections)
     'DestDB', 'dbo', 'Users',
     'UserID',
     'FullSyncTrigger',
@@ -143,7 +180,8 @@ VALUES (
 ```
 
 **Parameters:**
-- `server_id`: ID from `source_servers` table
+- `source_server_id`: ID from `server_connections` table (type='SOURCE')
+- `dest_server_id`: ID from `server_connections` table (type='DEST')
 - `source_database/schema/table`: Source table location
 - `dest_database/schema/table`: Destination table location
 - `primary_key_column`: Primary key column name
@@ -197,24 +235,27 @@ The service will automatically:
 To temporarily stop syncing:
 
 ```sql
--- Stop entire server
-UPDATE source_servers SET is_enabled = 0 WHERE server_id = 1;
+-- Stop server connection
+UPDATE server_connections SET is_enabled = 0 WHERE server_id = 1;
 
--- Stop specific table
+-- Stop specific table mapping
 UPDATE table_mappings SET is_enabled = 0 WHERE mapping_id = 1;
 
 -- Re-enable
-UPDATE source_servers SET is_enabled = 1 WHERE server_id = 1;
+UPDATE server_connections SET is_enabled = 1 WHERE server_id = 1;
 UPDATE table_mappings SET is_enabled = 1 WHERE mapping_id = 1;
 ```
 
 ## Database Tables
 
-### source_servers
-Stores source server connection information.
+### config
+Stores global configuration (intervals, parallel count, batch size, etc.)
+
+### server_connections
+Stores connection information for all servers (both SOURCE and DEST types)
 
 ### table_mappings
-Defines source-destination table mappings and sync configuration.
+Defines source-destination table mappings with references to server_connections
 
 ### sync_status
 Tracks the status of each sync operation (CDC or FULL_SYNC).
@@ -295,24 +336,32 @@ The service automatically performs MD5 verification every 5 minutes (default):
 
 ## Performance
 
-- **Batch Size**: 1,000 records per batch
-- **CDC Check Interval**: 10 seconds (default)
-- **Verification Interval**: 5 minutes (default)
+- **Batch Size**: Configurable via `config` table (default: 1,000)
+- **CDC Check Interval**: Configurable via `config` table (default: 10 seconds)
+- **Verification Interval**: Configurable via `config` table (default: 5 minutes)
+- **Parallel Workers**: Configurable via `config` table (default: 5 concurrent workers)
 - **Connection Pooling**: Maximum 50 open connections
-- **Concurrent Processing**: Multiple tables sync in parallel
+- **Dynamic Configuration**: Config reloads every minute without restart
 
 ## Configuration
 
-You can modify intervals by changing constants in `main.go`:
+All configuration is stored in the `config` table and reloaded every minute:
 
-```go
-const (
-    checkInterval        = 10 * time.Second
-    verificationInterval = 5 * time.Minute
-    maxRetryAttempts    = 3
-    retryDelay          = 30 * time.Second
-)
+```sql
+-- View current configuration
+SELECT * FROM config;
+
+-- Update CDC check interval (seconds)
+UPDATE config SET config_value = '15' WHERE config_key = 'cdc_check_interval_seconds';
+
+-- Update parallel worker count
+UPDATE config SET config_value = '10' WHERE config_key = 'parallel_scheduler_count';
+
+-- Update verification interval (minutes)
+UPDATE config SET config_value = '10' WHERE config_key = 'verification_interval_minutes';
 ```
+
+Changes take effect within 1 minute without restarting the service.
 
 ## Logging
 
@@ -333,8 +382,8 @@ Logs are also printed to stdout for real-time monitoring.
    - Enable CDC on source database and table
 
 3. **Configure Mapping**: 
-   - Add source server to `source_servers` table
-   - Add table mapping to `table_mappings` table
+   - Add source and destination servers to `server_connections` table
+   - Add table mapping to `table_mappings` table (with source_server_id and dest_server_id)
 
 4. **First Full Sync**: 
    - Set trigger column to 1 in source table
@@ -369,10 +418,11 @@ Logs are also printed to stdout for real-time monitoring.
 - Ensure primary key column exists in both tables
 
 ### Connection errors
-- Verify network connectivity between destination and source servers
-- Check connection strings in `source_servers` table
+- Verify network connectivity between config, source, and destination servers
+- Check connection strings in `server_connections` table
 - Verify SQL Server authentication credentials
 - Check firewall rules
+- Ensure both source and dest servers are enabled in `server_connections`
 
 ### Performance issues
 - Monitor `sync_status` table for slow operations

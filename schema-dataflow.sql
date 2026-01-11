@@ -1,8 +1,8 @@
 -- ============================================
 -- DBAOps DataFlow Database Schema
 -- ============================================
--- This database will be installed on DEST server
--- Can receive data from multiple SOURCE servers
+-- This schema can be installed on any SQL Server
+-- Supports multiple source and destination servers
 
 USE master;
 GO
@@ -18,23 +18,50 @@ USE dbaops_dataflow;
 GO
 
 -- ============================================
--- SOURCE SERVERS TABLE
+-- CONFIGURATION TABLE
 -- ============================================
--- Defines source servers
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'source_servers')
+-- Global configuration settings
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'config')
 BEGIN
-    CREATE TABLE source_servers (
+    CREATE TABLE config (
+        config_key NVARCHAR(100) PRIMARY KEY,
+        config_value NVARCHAR(500) NOT NULL,
+        description NVARCHAR(MAX) NULL,
+        updated_at DATETIME2 NOT NULL DEFAULT GETUTCDATE()
+    );
+    
+    -- Default configuration values
+    INSERT INTO config (config_key, config_value, description) VALUES
+    ('cdc_check_interval_seconds', '10', 'Interval in seconds for checking CDC changes'),
+    ('verification_interval_minutes', '5', 'Interval in minutes for MD5 verification'),
+    ('parallel_scheduler_count', '5', 'Number of parallel goroutines for processing tables'),
+    ('batch_size', '1000', 'Number of records per batch insert'),
+    ('max_retry_attempts', '3', 'Maximum retry attempts for failed operations'),
+    ('retry_delay_seconds', '30', 'Delay in seconds between retry attempts');
+END
+GO
+
+-- ============================================
+-- SERVER CONNECTIONS TABLE
+-- ============================================
+-- Stores connection information for all servers (source and destination)
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'server_connections')
+BEGIN
+    CREATE TABLE server_connections (
         server_id INT IDENTITY(1,1) PRIMARY KEY,
         server_name NVARCHAR(255) NOT NULL UNIQUE,
+        server_type NVARCHAR(50) NOT NULL, -- 'SOURCE' or 'DEST'
         connection_string NVARCHAR(1000) NOT NULL,
         is_enabled BIT NOT NULL DEFAULT 1,
         created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
         updated_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
         last_connected_at DATETIME2 NULL,
-        notes NVARCHAR(MAX) NULL
+        notes NVARCHAR(MAX) NULL,
+        CHECK (server_type IN ('SOURCE', 'DEST'))
     );
     
-    CREATE INDEX IX_source_servers_enabled ON source_servers(is_enabled);
+    CREATE INDEX IX_server_connections_type ON server_connections(server_type, is_enabled);
+    CREATE INDEX IX_server_connections_enabled ON server_connections(is_enabled);
 END
 GO
 
@@ -46,10 +73,11 @@ IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'table_mappings')
 BEGIN
     CREATE TABLE table_mappings (
         mapping_id INT IDENTITY(1,1) PRIMARY KEY,
-        server_id INT NOT NULL,
+        source_server_id INT NOT NULL,
         source_database NVARCHAR(255) NOT NULL,
         source_schema NVARCHAR(255) NOT NULL DEFAULT 'dbo',
         source_table NVARCHAR(255) NOT NULL,
+        dest_server_id INT NOT NULL,
         dest_database NVARCHAR(255) NOT NULL,
         dest_schema NVARCHAR(255) NOT NULL DEFAULT 'dbo',
         dest_table NVARCHAR(255) NOT NULL,
@@ -61,11 +89,13 @@ BEGIN
         last_full_sync_at DATETIME2 NULL,
         created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
         updated_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
-        FOREIGN KEY (server_id) REFERENCES source_servers(server_id) ON DELETE CASCADE,
-        UNIQUE(server_id, source_database, source_schema, source_table)
+        FOREIGN KEY (source_server_id) REFERENCES server_connections(server_id) ON DELETE CASCADE,
+        FOREIGN KEY (dest_server_id) REFERENCES server_connections(server_id) ON DELETE CASCADE,
+        UNIQUE(source_server_id, source_database, source_schema, source_table, dest_server_id, dest_database, dest_schema, dest_table)
     );
     
-    CREATE INDEX IX_table_mappings_server ON table_mappings(server_id, is_enabled);
+    CREATE INDEX IX_table_mappings_source_server ON table_mappings(source_server_id, is_enabled);
+    CREATE INDEX IX_table_mappings_dest_server ON table_mappings(dest_server_id, is_enabled);
     CREATE INDEX IX_table_mappings_enabled ON table_mappings(is_enabled);
 END
 GO
@@ -79,7 +109,7 @@ BEGIN
     CREATE TABLE sync_status (
         status_id BIGINT IDENTITY(1,1) PRIMARY KEY,
         mapping_id INT NOT NULL,
-        sync_type NVARCHAR(50) NOT NULL, -- 'CDC' veya 'FULL_SYNC'
+        sync_type NVARCHAR(50) NOT NULL, -- 'CDC' or 'FULL_SYNC'
         status NVARCHAR(50) NOT NULL, -- 'RUNNING', 'COMPLETED', 'ERROR', 'PAUSED'
         records_processed BIGINT NOT NULL DEFAULT 0,
         records_failed BIGINT NOT NULL DEFAULT 0,
@@ -137,7 +167,7 @@ BEGIN
         created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
         resolved_at DATETIME2 NULL,
         FOREIGN KEY (mapping_id) REFERENCES table_mappings(mapping_id) ON DELETE SET NULL,
-        FOREIGN KEY (server_id) REFERENCES source_servers(server_id) ON DELETE SET NULL
+        FOREIGN KEY (server_id) REFERENCES server_connections(server_id) ON DELETE SET NULL
     );
     
     CREATE INDEX IX_error_logs_mapping ON error_logs(mapping_id, created_at DESC);
@@ -184,7 +214,8 @@ GO
 
 CREATE VIEW v_sync_summary AS
 SELECT 
-    s.server_name,
+    sc_source.server_name AS source_server,
+    sc_dest.server_name AS dest_server,
     tm.source_database,
     tm.source_table,
     tm.dest_table,
@@ -197,7 +228,8 @@ SELECT
     DATEDIFF(SECOND, ss.started_at, ISNULL(ss.completed_at, GETUTCDATE())) AS duration_seconds
 FROM sync_status ss
 INNER JOIN table_mappings tm ON ss.mapping_id = tm.mapping_id
-INNER JOIN source_servers s ON tm.server_id = s.server_id
+INNER JOIN server_connections sc_source ON tm.source_server_id = sc_source.server_id
+INNER JOIN server_connections sc_dest ON tm.dest_server_id = sc_dest.server_id
 WHERE ss.status IN ('RUNNING', 'ERROR')
 GO
 
@@ -209,7 +241,7 @@ GO
 CREATE VIEW v_recent_errors AS
 SELECT TOP 100
     el.error_id,
-    s.server_name,
+    sc.server_name,
     tm.source_table,
     tm.dest_table,
     el.error_type,
@@ -218,7 +250,7 @@ SELECT TOP 100
     el.is_resolved,
     el.created_at
 FROM error_logs el
-LEFT JOIN source_servers s ON el.server_id = s.server_id
+LEFT JOIN server_connections sc ON el.server_id = sc.server_id
 LEFT JOIN table_mappings tm ON el.mapping_id = tm.mapping_id
 WHERE el.is_resolved = 0
 ORDER BY el.created_at DESC
@@ -226,4 +258,3 @@ GO
 
 PRINT 'DBAOps DataFlow schema created successfully!';
 GO
-

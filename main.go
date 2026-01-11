@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,25 +15,24 @@ import (
 	_ "github.com/denisenkom/go-mssqldb"
 )
 
-const (
-	// Config
-	destConnectionString = "server=%s;user id=%s;password=%s;database=dbaops_dataflow;encrypt=disable"
-	checkInterval        = 10 * time.Second // CDC check interval
-	verificationInterval = 5 * time.Minute  // MD5 verification interval
-	maxRetryAttempts    = 3
-	retryDelay          = 30 * time.Second
-)
-
 var (
-	destDB   *sql.DB
-	stopChan = make(chan struct{})
-	wg       sync.WaitGroup
+	configDB        *sql.DB
+	stopChan        = make(chan struct{})
+	wg              sync.WaitGroup
+	configMu        sync.RWMutex
+	cdcInterval     = 10 * time.Second
+	verificationInterval = 5 * time.Minute
+	parallelWorkers = 5
+	batchSize       = 1000
+	maxRetryAttempts = 3
+	retryDelay      = 30 * time.Second
 )
 
-// SourceServer represents a source server configuration
-type SourceServer struct {
+// ServerConnection represents a server connection (source or destination)
+type ServerConnection struct {
 	ServerID      int
 	ServerName    string
+	ServerType    string
 	ConnString    string
 	IsEnabled     bool
 	LastConnected *time.Time
@@ -41,65 +41,135 @@ type SourceServer struct {
 // TableMapping represents a source-dest table mapping
 type TableMapping struct {
 	MappingID            int
-	ServerID             int
+	SourceServerID       int
 	SourceDatabase       string
 	SourceSchema         string
 	SourceTable          string
-	DestDatabase         string
-	DestSchema           string
-	DestTable            string
-	PrimaryKeyColumn     string
-	FullSyncTriggerCol   sql.NullString
-	IsEnabled            bool
-	CDCEnabled           bool
-	LastCDCLSN           sql.NullString
-	LastFullSyncAt       sql.NullTime
+	DestServerID          int
+	DestDatabase          string
+	DestSchema            string
+	DestTable             string
+	PrimaryKeyColumn      string
+	FullSyncTriggerCol    sql.NullString
+	IsEnabled             bool
+	CDCEnabled            bool
+	LastCDCLSN            sql.NullString
+	LastFullSyncAt        sql.NullTime
+	SourceConnString      string
+	DestConnString        string
 }
 
 // SyncStatus represents current sync status
 type SyncStatus struct {
 	StatusID        int64
-	MappingID      int
-	SyncType       string
-	Status         string
+	MappingID       int
+	SyncType        string
+	Status          string
 	RecordsProcessed int64
 	RecordsFailed   int64
-	StartedAt      time.Time
-	CompletedAt    sql.NullTime
-	ErrorMessage   sql.NullString
+	StartedAt       time.Time
+	CompletedAt     sql.NullTime
+	ErrorMessage    sql.NullString
 	LastProcessedPK sql.NullString
 }
 
 func init() {
-	// Get dest connection from env
-	destServer := getEnv("DEST_SERVER", "localhost")
-	destUser := getEnv("DEST_USER", "sa")
-	destPass := getEnv("DEST_PASS", "")
+	configServer := getEnv("CONFIG_SERVER", "localhost")
+	configUser := getEnv("CONFIG_USER", "sa")
+	configPass := getEnv("CONFIG_PASS", "")
 	
-	if destPass == "" {
-		log.Fatal("DEST_PASS environment variable required")
+	if configPass == "" {
+		log.Fatal("CONFIG_PASS environment variable required")
 	}
 
-	connStr := fmt.Sprintf(destConnectionString, destServer, destUser, destPass)
+	connStr := fmt.Sprintf("server=%s;user id=%s;password=%s;database=dbaops_dataflow;encrypt=disable",
+		configServer, configUser, configPass)
+	
 	var err error
-	destDB, err = sql.Open("sqlserver", connStr)
+	configDB, err = sql.Open("sqlserver", connStr)
 	if err != nil {
-		log.Fatalf("Failed to connect to dest database: %v", err)
+		log.Fatalf("Failed to connect to config database: %v", err)
 	}
 
-	if err := destDB.Ping(); err != nil {
-		log.Fatalf("Failed to ping dest database: %v", err)
+	if err := configDB.Ping(); err != nil {
+		log.Fatalf("Failed to ping config database: %v", err)
 	}
 
-	destDB.SetMaxOpenConns(50)
-	destDB.SetMaxIdleConns(10)
-	destDB.SetConnMaxLifetime(5 * time.Minute)
+	configDB.SetMaxOpenConns(50)
+	configDB.SetMaxIdleConns(10)
+	configDB.SetConnMaxLifetime(5 * time.Minute)
 
-	log.Println("Connected to destination database")
+	log.Println("Connected to configuration database")
+
+	// Load initial configuration
+	loadConfiguration()
+}
+
+func loadConfiguration() {
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	// Load CDC check interval
+	if val := getConfigValue("cdc_check_interval_seconds"); val != "" {
+		if seconds, err := strconv.Atoi(val); err == nil && seconds > 0 {
+			cdcInterval = time.Duration(seconds) * time.Second
+		}
+	}
+
+	// Load verification interval
+	if val := getConfigValue("verification_interval_minutes"); val != "" {
+		if minutes, err := strconv.Atoi(val); err == nil && minutes > 0 {
+			verificationInterval = time.Duration(minutes) * time.Minute
+		}
+	}
+
+	// Load parallel scheduler count
+	if val := getConfigValue("parallel_scheduler_count"); val != "" {
+		if count, err := strconv.Atoi(val); err == nil && count > 0 {
+			parallelWorkers = count
+		}
+	}
+
+	// Load batch size
+	if val := getConfigValue("batch_size"); val != "" {
+		if size, err := strconv.Atoi(val); err == nil && size > 0 {
+			batchSize = size
+		}
+	}
+
+	// Load max retry attempts
+	if val := getConfigValue("max_retry_attempts"); val != "" {
+		if attempts, err := strconv.Atoi(val); err == nil && attempts > 0 {
+			maxRetryAttempts = attempts
+		}
+	}
+
+	// Load retry delay
+	if val := getConfigValue("retry_delay_seconds"); val != "" {
+		if seconds, err := strconv.Atoi(val); err == nil && seconds > 0 {
+			retryDelay = time.Duration(seconds) * time.Second
+		}
+	}
+
+	log.Printf("Configuration loaded: CDC interval=%v, Verification interval=%v, Parallel workers=%d, Batch size=%d",
+		cdcInterval, verificationInterval, parallelWorkers, batchSize)
+}
+
+func getConfigValue(key string) string {
+	var value string
+	err := configDB.QueryRow("SELECT config_value FROM config WHERE config_key = @p1", key).Scan(&value)
+	if err != nil {
+		return ""
+	}
+	return value
 }
 
 func main() {
 	log.Println("DBAOps DataFlow starting...")
+
+	// Start config reloader (reload every minute)
+	wg.Add(1)
+	go configReloader()
 
 	// Start main sync loop
 	wg.Add(1)
@@ -109,25 +179,22 @@ func main() {
 	wg.Add(1)
 	go verificationLoop()
 
-	// Wait for stop signal (Ctrl+C or SIGTERM)
-	// In production, you'd handle signals properly
+	// Wait for stop signal
 	select {
 	case <-stopChan:
 		log.Println("Stopping DBAOps DataFlow...")
 	}
 
-	// Graceful shutdown
 	close(stopChan)
 	wg.Wait()
 	
-	destDB.Close()
+	configDB.Close()
 	log.Println("Shutdown complete")
 }
 
-func syncLoop() {
+func configReloader() {
 	defer wg.Done()
-
-	ticker := time.NewTicker(checkInterval)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -135,7 +202,37 @@ func syncLoop() {
 		case <-stopChan:
 			return
 		case <-ticker.C:
-			processAllServers()
+			loadConfiguration()
+		}
+	}
+}
+
+func syncLoop() {
+	defer wg.Done()
+
+	configMu.RLock()
+	interval := cdcInterval
+	configMu.RUnlock()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopChan:
+			return
+		case <-ticker.C:
+			processAllMappings()
+			
+			// Reload interval in case it changed
+			configMu.RLock()
+			newInterval := cdcInterval
+			configMu.RUnlock()
+			if newInterval != interval {
+				ticker.Stop()
+				ticker = time.NewTicker(newInterval)
+				interval = newInterval
+			}
 		}
 	}
 }
@@ -143,7 +240,11 @@ func syncLoop() {
 func verificationLoop() {
 	defer wg.Done()
 
-	ticker := time.NewTicker(verificationInterval)
+	configMu.RLock()
+	interval := verificationInterval
+	configMu.RUnlock()
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -152,108 +253,132 @@ func verificationLoop() {
 			return
 		case <-ticker.C:
 			performAllVerifications()
-		}
-	}
-}
-
-func performAllVerifications() {
-	servers, err := getEnabledServers()
-	if err != nil {
-		log.Printf("Error getting servers for verification: %v", err)
-		return
-	}
-
-	for _, server := range servers {
-		if !server.IsEnabled {
-			continue
-		}
-
-		mappings, err := getTableMappings(server.ServerID)
-		if err != nil {
-			continue
-		}
-
-		sourceDB, err := connectToSource(server.ConnString)
-		if err != nil {
-			continue
-		}
-
-		for _, mapping := range mappings {
-			if !mapping.IsEnabled {
-				continue
+			
+			// Reload interval in case it changed
+			configMu.RLock()
+			newInterval := verificationInterval
+			configMu.RUnlock()
+			if newInterval != interval {
+				ticker.Stop()
+				ticker = time.NewTicker(newInterval)
+				interval = newInterval
 			}
-
-			wg.Add(1)
-			go func(m TableMapping, s SourceServer, db *sql.DB) {
-				defer wg.Done()
-				defer db.Close()
-				performVerification(m, db)
-			}(mapping, server, sourceDB)
 		}
 	}
 }
 
-func processAllServers() {
-	servers, err := getEnabledServers()
+func processAllMappings() {
+	mappings, err := getEnabledMappings()
 	if err != nil {
-		log.Printf("Error getting servers: %v", err)
+		log.Printf("Error getting mappings: %v", err)
 		return
 	}
 
-	for _, server := range servers {
-		if !server.IsEnabled {
-			continue
-		}
-
-		wg.Add(1)
-		go func(s SourceServer) {
-			defer wg.Done()
-			processServer(s)
-		}(server)
+	if len(mappings) == 0 {
+		return
 	}
+
+	// Use worker pool pattern for parallel processing
+	configMu.RLock()
+	workers := parallelWorkers
+	configMu.RUnlock()
+
+	// Limit workers to number of mappings
+	if workers > len(mappings) {
+		workers = len(mappings)
+	}
+
+	// Create worker pool
+	jobs := make(chan TableMapping, len(mappings))
+	var wgWorkers sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < workers; i++ {
+		wgWorkers.Add(1)
+		go func() {
+			defer wgWorkers.Done()
+			for mapping := range jobs {
+				processMapping(mapping)
+			}
+		}()
+	}
+
+	// Send jobs
+	for _, mapping := range mappings {
+		jobs <- mapping
+	}
+	close(jobs)
+
+	// Wait for all workers to finish
+	wgWorkers.Wait()
 }
 
-func processServer(server SourceServer) {
-	// Update last connected
-	updateLastConnected(server.ServerID)
-
-	// Get enabled table mappings for this server
-	mappings, err := getTableMappings(server.ServerID)
-	if err != nil {
-		logError(nil, &server.ServerID, "CONNECTION", fmt.Sprintf("Failed to get table mappings: %v", err), nil)
-		return
-	}
-
+func processMapping(mapping TableMapping) {
 	// Connect to source server
-	sourceDB, err := connectToSource(server.ConnString)
+	sourceDB, err := connectToServer(mapping.SourceConnString)
 	if err != nil {
-		logError(nil, &server.ServerID, "CONNECTION", fmt.Sprintf("Failed to connect to source: %v", err), nil)
+		logError(&mapping.MappingID, &mapping.SourceServerID, "CONNECTION",
+			fmt.Sprintf("Failed to connect to source server: %v", err), nil)
 		return
 	}
 	defer sourceDB.Close()
 
-	// Process each table mapping
-	for _, mapping := range mappings {
-		if !mapping.IsEnabled {
-			continue
-		}
+	// Update last connected for source
+	updateLastConnected(mapping.SourceServerID)
 
-		// Check if full sync is needed
-		if needsFullSync(mapping, sourceDB) {
-			wg.Add(1)
-			go func(m TableMapping) {
-				defer wg.Done()
-				performFullSync(m, sourceDB, server)
-			}(mapping)
-		} else if mapping.CDCEnabled {
-			// Process CDC changes
-			wg.Add(1)
-			go func(m TableMapping) {
-				defer wg.Done()
-				processCDC(m, sourceDB, server)
-			}(mapping)
-		}
+	// Check if full sync is needed
+	if needsFullSync(mapping, sourceDB) {
+		performFullSync(mapping, sourceDB)
+	} else if mapping.CDCEnabled {
+		// Process CDC changes
+		processCDC(mapping, sourceDB)
 	}
+}
+
+func performAllVerifications() {
+	mappings, err := getEnabledMappings()
+	if err != nil {
+		log.Printf("Error getting mappings for verification: %v", err)
+		return
+	}
+
+	if len(mappings) == 0 {
+		return
+	}
+
+	// Use worker pool for verification
+	configMu.RLock()
+	workers := parallelWorkers
+	configMu.RUnlock()
+
+	if workers > len(mappings) {
+		workers = len(mappings)
+	}
+
+	jobs := make(chan TableMapping, len(mappings))
+	var wgWorkers sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wgWorkers.Add(1)
+		go func() {
+			defer wgWorkers.Done()
+			for mapping := range jobs {
+				sourceDB, err := connectToServer(mapping.SourceConnString)
+				if err != nil {
+					continue
+				}
+				performVerification(mapping, sourceDB)
+				sourceDB.Close()
+			}
+		}()
+	}
+
+	for _, mapping := range mappings {
+		jobs <- mapping
+	}
+	close(jobs)
+
+	wgWorkers.Wait()
 }
 
 func needsFullSync(mapping TableMapping, sourceDB *sql.DB) bool {
@@ -261,7 +386,6 @@ func needsFullSync(mapping TableMapping, sourceDB *sql.DB) bool {
 		return false
 	}
 
-	// Check if trigger column is set to 1
 	query := fmt.Sprintf(`
 		SELECT TOP 1 CAST(%s AS INT) 
 		FROM [%s].[%s].[%s]
@@ -279,7 +403,7 @@ func needsFullSync(mapping TableMapping, sourceDB *sql.DB) bool {
 	return triggerValue == 1
 }
 
-func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer) {
+func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	statusID := startSyncStatus(mapping.MappingID, "FULL_SYNC", "RUNNING")
 	if statusID == 0 {
 		return
@@ -290,16 +414,29 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer
 	// Schema validation
 	if !validateSchema(mapping, sourceDB) {
 		updateSyncStatus(statusID, "ERROR", 0, 0, "Schema validation failed")
-		logError(&mapping.MappingID, &server.ServerID, "SCHEMA", "Schema validation failed", nil)
+		logError(&mapping.MappingID, &mapping.SourceServerID, "SCHEMA", "Schema validation failed", nil)
 		return
 	}
 
 	logSync(mapping.MappingID, "INFO", "Schema validation passed", "SCHEMA_CHECK", 0, 0)
 
-	// Get source connection string for dest operations
-	destConnStr := getDestConnectionString(mapping.DestDatabase)
+	// Connect to destination server
+	destDB, err := connectToServer(mapping.DestConnString)
+	if err != nil {
+		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
+		logError(&mapping.MappingID, &mapping.DestServerID, "CONNECTION",
+			fmt.Sprintf("Failed to connect to destination server: %v", err), nil)
+		return
+	}
+	defer destDB.Close()
 
-	// Get all data from source
+	// Switch to destination database
+	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
+	if err != nil {
+		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
+		return
+	}
+
 	startTime := time.Now()
 	recordsProcessed := int64(0)
 	recordsFailed := int64(0)
@@ -313,32 +450,25 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer
 	rows, err := sourceDB.Query(selectQuery)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
-		logError(&mapping.MappingID, &server.ServerID, "SYNC", fmt.Sprintf("Failed to query source: %v", err), nil)
+		logError(&mapping.MappingID, &mapping.SourceServerID, "SYNC",
+			fmt.Sprintf("Failed to query source: %v", err), nil)
 		return
 	}
 	defer rows.Close()
 
-	// Get column names
 	columns, err := rows.Columns()
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
 		return
 	}
 
-	// Connect to dest database
-	destDBForTable, err := sql.Open("sqlserver", destConnStr)
-	if err != nil {
-		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
-		return
-	}
-	defer destDBForTable.Close()
-
 	// Truncate dest table (full sync)
-	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]", mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
-	_, err = destDBForTable.Exec(truncateQuery)
+	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	_, err = destDB.Exec(truncateQuery)
 	if err != nil {
-		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
-		// Continue anyway, will try to insert
+		logSync(mapping.MappingID, "WARNING",
+			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
 	// Build INSERT query
@@ -354,8 +484,11 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer
 		strings.Join(placeholders, ", "))
 
 	// Batch insert
-	batchSize := 1000
-	batch := make([][]interface{}, 0, batchSize)
+	configMu.RLock()
+	batchSizeLocal := batchSize
+	configMu.RUnlock()
+
+	batch := make([][]interface{}, 0, batchSizeLocal)
 	var lastPKValue interface{}
 
 	for rows.Next() {
@@ -382,10 +515,11 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer
 		batch = append(batch, values)
 		recordsProcessed++
 
-		if len(batch) >= batchSize {
-			if err := executeBatchInsert(destDBForTable, insertQuery, columns, batch); err != nil {
+		if len(batch) >= batchSizeLocal {
+			if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
 				recordsFailed += int64(len(batch))
-				logSync(mapping.MappingID, "ERROR", fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
+				logSync(mapping.MappingID, "ERROR",
+					fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
 			}
 			batch = batch[:0]
 		}
@@ -393,9 +527,10 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer
 
 	// Insert remaining batch
 	if len(batch) > 0 {
-		if err := executeBatchInsert(destDBForTable, insertQuery, columns, batch); err != nil {
+		if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
 			recordsFailed += int64(len(batch))
-			logSync(mapping.MappingID, "ERROR", fmt.Sprintf("Final batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
+			logSync(mapping.MappingID, "ERROR",
+				fmt.Sprintf("Final batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
 		}
 	}
 
@@ -407,13 +542,11 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer
 			WHERE %s = 1
 		`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
 			mapping.FullSyncTriggerCol.String, mapping.FullSyncTriggerCol.String)
-		sourceDB.Exec(resetQuery) // Ignore errors, source is read-only intent
+		sourceDB.Exec(resetQuery)
 	}
 
-	// Update last full sync time
 	updateLastFullSync(mapping.MappingID)
 
-	// Update sync status
 	duration := time.Since(startTime)
 	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, recordsFailed, "")
 	
@@ -423,14 +556,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB, server SourceServer
 	}
 	updateLastProcessedPK(statusID, lastPKStr)
 
-	logSync(mapping.MappingID, "INFO", 
-		fmt.Sprintf("Full sync completed: %d processed, %d failed, duration: %v", 
+	logSync(mapping.MappingID, "INFO",
+		fmt.Sprintf("Full sync completed: %d processed, %d failed, duration: %v",
 			recordsProcessed, recordsFailed, duration),
 		"FULL_SYNC", recordsProcessed, int(duration.Milliseconds()))
 }
 
-func processCDC(mapping TableMapping, sourceDB *sql.DB, server SourceServer) {
-	// Check if CDC is enabled on source table
+func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	if !isCDCEnabled(mapping, sourceDB) {
 		logSync(mapping.MappingID, "WARNING", "CDC not enabled on source table", "CDC", 0, 0)
 		return
@@ -441,10 +573,8 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB, server SourceServer) {
 		return
 	}
 
-	// Get last processed LSN
 	lastLSN := mapping.LastCDCLSN.String
 	if lastLSN == "" {
-		// Get minimum LSN
 		lastLSN = getMinLSN(mapping, sourceDB)
 		if lastLSN == "" {
 			updateSyncStatus(statusID, "COMPLETED", 0, 0, "No CDC data available")
@@ -452,11 +582,11 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB, server SourceServer) {
 		}
 	}
 
-	// Get changes since last LSN
 	changes, err := getCDCChanges(mapping, sourceDB, lastLSN)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
-		logError(&mapping.MappingID, &server.ServerID, "CDC", fmt.Sprintf("Failed to get CDC changes: %v", err), nil)
+		logError(&mapping.MappingID, &mapping.SourceServerID, "CDC",
+			fmt.Sprintf("Failed to get CDC changes: %v", err), nil)
 		return
 	}
 
@@ -465,39 +595,62 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB, server SourceServer) {
 		return
 	}
 
-	// Apply changes to dest
-	recordsProcessed := int64(0)
-	recordsFailed := int64(0)
-	var newLSN string
-
-	destConnStr := getDestConnectionString(mapping.DestDatabase)
-	destDBForTable, err := sql.Open("sqlserver", destConnStr)
+	// Connect to destination server
+	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
 		return
 	}
-	defer destDBForTable.Close()
+	defer destDB.Close()
+
+	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
+	if err != nil {
+		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
+		return
+	}
+
+	recordsProcessed := int64(0)
+	recordsFailed := int64(0)
+	var newLSN string
 
 	for _, change := range changes {
-		// Extract LSN (binary) and convert to hex string
 		if lsnVal, ok := change["__$start_lsn"]; ok {
 			if lsnBytes, ok := lsnVal.([]byte); ok {
 				newLSN = hex.EncodeToString(lsnBytes)
+			} else if lsnStr, ok := lsnVal.(string); ok {
+				newLSN = lsnStr
 			} else {
 				newLSN = fmt.Sprintf("%v", lsnVal)
 			}
 		}
 
-		operation := change["__$operation"].(int)
+		// Get operation type (can be int or string from CDC)
+		var operation int
+		if opVal, ok := change["__$operation"]; ok {
+			switch v := opVal.(type) {
+			case int:
+				operation = v
+			case int64:
+				operation = int(v)
+			case string:
+				if opInt, err := strconv.Atoi(v); err == nil {
+					operation = opInt
+				}
+			}
+		}
+
 		switch operation {
-		case 1: // Delete
-			err = applyDelete(destDBForTable, mapping, change)
-		case 2: // Insert
-			err = applyInsert(destDBForTable, mapping, change)
-		case 3: // Update (before)
-			// Skip, will handle in update (after)
-		case 4: // Update (after)
-			err = applyUpdate(destDBForTable, mapping, change)
+		case 1:
+			err = applyDelete(destDB, mapping, change)
+		case 2:
+			err = applyInsert(destDB, mapping, change)
+		case 3:
+			// Skip update before
+		case 4:
+			err = applyUpdate(destDB, mapping, change)
+		default:
+			logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Unknown CDC operation: %d", operation), "CDC", 0, 0)
+			continue
 		}
 
 		if err != nil {
@@ -508,7 +661,6 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB, server SourceServer) {
 		}
 	}
 
-	// Update last LSN
 	if newLSN != "" {
 		updateLastLSN(mapping.MappingID, newLSN)
 	}
@@ -516,14 +668,13 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB, server SourceServer) {
 	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, recordsFailed, "")
 	
 	if recordsProcessed > 0 {
-		logSync(mapping.MappingID, "INFO", 
+		logSync(mapping.MappingID, "INFO",
 			fmt.Sprintf("CDC sync completed: %d processed, %d failed", recordsProcessed, recordsFailed),
 			"CDC", recordsProcessed, 0)
 	}
 }
 
 func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
-	// Check if source table exists
 	checkTableQuery := fmt.Sprintf(`
 		SELECT COUNT(*) 
 		FROM INFORMATION_SCHEMA.TABLES 
@@ -537,7 +688,6 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 		return false
 	}
 
-	// Check if PK column exists
 	checkPKQuery := fmt.Sprintf(`
 		SELECT COUNT(*) 
 		FROM INFORMATION_SCHEMA.COLUMNS 
@@ -551,27 +701,27 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 		return false
 	}
 
-	// Get source columns
 	sourceCols, err := getTableColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	if err != nil {
 		return false
 	}
 
-	// Get dest columns (if table exists)
-	destConnStr := getDestConnectionString(mapping.DestDatabase)
-	destDBForTable, err := sql.Open("sqlserver", destConnStr)
+	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		return false
 	}
-	defer destDBForTable.Close()
+	defer destDB.Close()
 
-	destCols, err := getTableColumns(destDBForTable, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
-		// Table might not exist, that's OK for full sync
+		return false
+	}
+
+	destCols, err := getTableColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	if err != nil {
 		return true
 	}
 
-	// Compare column names (case-insensitive)
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
 		sourceColMap[strings.ToLower(col)] = true
@@ -645,7 +795,6 @@ func executeBatchInsert(db *sql.DB, query string, columns []string, batch [][]in
 }
 
 func applyInsert(db *sql.DB, mapping TableMapping, change map[string]interface{}) error {
-	// Extract column names (excluding CDC metadata columns)
 	columns := make([]string, 0)
 	values := make([]interface{}, 0)
 	placeholders := make([]string, 0)
@@ -676,7 +825,6 @@ func applyInsert(db *sql.DB, mapping TableMapping, change map[string]interface{}
 }
 
 func applyUpdate(db *sql.DB, mapping TableMapping, change map[string]interface{}) error {
-	// Build SET clause
 	setParts := make([]string, 0)
 	values := make([]interface{}, 0)
 	paramIndex := 1
@@ -690,7 +838,6 @@ func applyUpdate(db *sql.DB, mapping TableMapping, change map[string]interface{}
 		paramIndex++
 	}
 
-	// Build WHERE clause for PK
 	pkValue, ok := change[mapping.PrimaryKeyColumn]
 	if !ok {
 		return fmt.Errorf("primary key column %s not found in change", mapping.PrimaryKeyColumn)
@@ -732,14 +879,12 @@ func applyDelete(db *sql.DB, mapping TableMapping, change map[string]interface{}
 }
 
 func isCDCEnabled(mapping TableMapping, db *sql.DB) bool {
-	// Check if CDC is enabled on database
 	var isCDCEnabled int
 	db.QueryRow(fmt.Sprintf("SELECT is_cdc_enabled FROM sys.databases WHERE name = '%s'", mapping.SourceDatabase)).Scan(&isCDCEnabled)
 	if isCDCEnabled == 0 {
 		return false
 	}
 
-	// Check if CDC is enabled on table
 	query := fmt.Sprintf(`
 		SELECT COUNT(*) 
 		FROM cdc.change_tables 
@@ -754,7 +899,6 @@ func isCDCEnabled(mapping TableMapping, db *sql.DB) bool {
 }
 
 func getMinLSN(mapping TableMapping, db *sql.DB) string {
-	// Get capture instance name first
 	var captureInstance sql.NullString
 	query := fmt.Sprintf(`
 		SELECT capture_instance 
@@ -766,7 +910,6 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		return ""
 	}
 
-	// Get minimum LSN from CDC tables
 	lsnQuery := fmt.Sprintf(`
 		SELECT MIN(__$start_lsn)
 		FROM cdc.[%s]
@@ -777,13 +920,10 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		return ""
 	}
 	
-	// Convert binary LSN to hex string for storage
 	return hex.EncodeToString(lsn)
 }
 
 func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[string]interface{}, error) {
-	// Use CDC tables (cdc.capture_instance_CT)
-	// First, get the capture instance name
 	var captureInstance sql.NullString
 	query := fmt.Sprintf(`
 		SELECT capture_instance 
@@ -795,13 +935,11 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 		return nil, fmt.Errorf("CDC capture instance not found for table")
 	}
 
-	// Convert hex string back to binary for LSN comparison
 	lsnBytes, err := hex.DecodeString(lastLSN)
 	if err != nil {
 		return nil, fmt.Errorf("invalid LSN format: %v", err)
 	}
 
-	// Query CDC changes - use parameterized query for LSN
 	cdcQuery := fmt.Sprintf(`
 		DECLARE @from_lsn BINARY(10) = @p1
 		SELECT *
@@ -834,7 +972,7 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 		for i, col := range columns {
 			val := values[i]
 			if b, ok := val.([]byte); ok {
-				change[col] = hex.EncodeToString(b) // LSN is binary, convert to hex string
+				change[col] = hex.EncodeToString(b)
 			} else {
 				change[col] = val
 			}
@@ -847,22 +985,24 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 }
 
 func performVerification(mapping TableMapping, sourceDB *sql.DB) {
-	// Get last inserted PK from dest
-	destConnStr := getDestConnectionString(mapping.DestDatabase)
-	destDBForTable, err := sql.Open("sqlserver", destConnStr)
+	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		return
 	}
-	defer destDBForTable.Close()
+	defer destDB.Close()
 
-	// Get last 10k records from dest (or less if not available)
+	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
+	if err != nil {
+		return
+	}
+
 	query := fmt.Sprintf(`
 		SELECT TOP 10000 *
 		FROM [%s].[%s].[%s]
 		ORDER BY %s DESC
 	`, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
 
-	destRows, err := destDBForTable.Query(query)
+	destRows, err := destDB.Query(query)
 	if err != nil {
 		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query dest: %v", err), nil)
 		return
@@ -899,7 +1039,6 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Get corresponding records from source
 	pkValues := make([]interface{}, 0)
 	for _, row := range destData {
 		if pkVal, ok := row[mapping.PrimaryKeyColumn]; ok {
@@ -911,11 +1050,10 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Build IN clause (limited to avoid query size issues)
 	pkPlaceholders := make([]string, 0)
 	pkArgs := make([]interface{}, 0)
 	for i, pkVal := range pkValues {
-		if i >= 1000 { // Limit to 1000 for safety
+		if i >= 1000 {
 			break
 		}
 		pkPlaceholders = append(pkPlaceholders, fmt.Sprintf("@pk%d", i+1))
@@ -970,7 +1108,6 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	// Compare MD5 hashes
 	mismatches := int64(0)
 	compared := int64(0)
 
@@ -983,7 +1120,6 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 			continue
 		}
 
-		// Calculate MD5 for both rows
 		destMD5 := calculateRowMD5(destRow)
 		sourceMD5 := calculateRowMD5(sourceRow)
 
@@ -998,24 +1134,21 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		status = "FAILED"
 	}
 
-	// Log verification result
-	logVerification(mapping.MappingID, "MD5_COMPARISON", "", "", 
+	logVerification(mapping.MappingID, "MD5_COMPARISON", "", "",
 		int64(len(destData)), int64(len(sourceData)), compared, mismatches, status, "")
 
 	if mismatches > 0 {
-		logError(&mapping.MappingID, nil, "VERIFICATION", 
+		logError(&mapping.MappingID, nil, "VERIFICATION",
 			fmt.Sprintf("MD5 verification failed: %d mismatches out of %d compared", mismatches, compared), nil)
 	}
 }
 
 func calculateRowMD5(row map[string]interface{}) string {
-	// Sort keys for consistent hashing
 	keys := make([]string, 0, len(row))
 	for k := range row {
 		keys = append(keys, k)
 	}
 
-	// Build string representation
 	var sb strings.Builder
 	for _, k := range keys {
 		sb.WriteString(k)
@@ -1028,42 +1161,33 @@ func calculateRowMD5(row map[string]interface{}) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// Database helper functions
-
-func getEnabledServers() ([]SourceServer, error) {
-	query := `SELECT server_id, server_name, connection_string, is_enabled, last_connected_at 
-	          FROM source_servers WHERE is_enabled = 1`
+func getEnabledMappings() ([]TableMapping, error) {
+	query := `SELECT 
+		tm.mapping_id, 
+		tm.source_server_id,
+		tm.source_database, 
+		tm.source_schema, 
+		tm.source_table,
+		tm.dest_server_id,
+		tm.dest_database, 
+		tm.dest_schema, 
+		tm.dest_table, 
+		tm.primary_key_column,
+		tm.full_sync_trigger_column, 
+		tm.is_enabled, 
+		tm.cdc_enabled, 
+		tm.last_cdc_lsn, 
+		tm.last_full_sync_at,
+		sc_source.connection_string AS source_conn_string,
+		sc_dest.connection_string AS dest_conn_string
+	FROM table_mappings tm
+	INNER JOIN server_connections sc_source ON tm.source_server_id = sc_source.server_id
+	INNER JOIN server_connections sc_dest ON tm.dest_server_id = sc_dest.server_id
+	WHERE tm.is_enabled = 1 
+	AND sc_source.is_enabled = 1 
+	AND sc_dest.is_enabled = 1`
 	
-	rows, err := destDB.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var servers []SourceServer
-	for rows.Next() {
-		var s SourceServer
-		var lastConn sql.NullTime
-		if err := rows.Scan(&s.ServerID, &s.ServerName, &s.ConnString, &s.IsEnabled, &lastConn); err != nil {
-			continue
-		}
-		if lastConn.Valid {
-			s.LastConnected = &lastConn.Time
-		}
-		servers = append(servers, s)
-	}
-
-	return servers, nil
-}
-
-func getTableMappings(serverID int) ([]TableMapping, error) {
-	query := `SELECT mapping_id, server_id, source_database, source_schema, source_table,
-	                 dest_database, dest_schema, dest_table, primary_key_column,
-	                 full_sync_trigger_column, is_enabled, cdc_enabled, last_cdc_lsn, last_full_sync_at
-	          FROM table_mappings 
-	          WHERE server_id = @p1 AND is_enabled = 1`
-	
-	rows, err := destDB.Query(query, serverID)
+	rows, err := configDB.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -1072,9 +1196,10 @@ func getTableMappings(serverID int) ([]TableMapping, error) {
 	var mappings []TableMapping
 	for rows.Next() {
 		var m TableMapping
-		if err := rows.Scan(&m.MappingID, &m.ServerID, &m.SourceDatabase, &m.SourceSchema, &m.SourceTable,
-			&m.DestDatabase, &m.DestSchema, &m.DestTable, &m.PrimaryKeyColumn,
-			&m.FullSyncTriggerCol, &m.IsEnabled, &m.CDCEnabled, &m.LastCDCLSN, &m.LastFullSyncAt); err != nil {
+		if err := rows.Scan(&m.MappingID, &m.SourceServerID, &m.SourceDatabase, &m.SourceSchema, &m.SourceTable,
+			&m.DestServerID, &m.DestDatabase, &m.DestSchema, &m.DestTable, &m.PrimaryKeyColumn,
+			&m.FullSyncTriggerCol, &m.IsEnabled, &m.CDCEnabled, &m.LastCDCLSN, &m.LastFullSyncAt,
+			&m.SourceConnString, &m.DestConnString); err != nil {
 			continue
 		}
 		mappings = append(mappings, m)
@@ -1083,7 +1208,7 @@ func getTableMappings(serverID int) ([]TableMapping, error) {
 	return mappings, nil
 }
 
-func connectToSource(connString string) (*sql.DB, error) {
+func connectToServer(connString string) (*sql.DB, error) {
 	db, err := sql.Open("sqlserver", connString)
 	if err != nil {
 		return nil, err
@@ -1096,21 +1221,13 @@ func connectToSource(connString string) (*sql.DB, error) {
 	return db, nil
 }
 
-func getDestConnectionString(database string) string {
-	destServer := getEnv("DEST_SERVER", "localhost")
-	destUser := getEnv("DEST_USER", "sa")
-	destPass := getEnv("DEST_PASS", "")
-	return fmt.Sprintf("server=%s;user id=%s;password=%s;database=%s;encrypt=disable", 
-		destServer, destUser, destPass, database)
-}
-
 func updateLastConnected(serverID int) {
-	destDB.Exec("UPDATE source_servers SET last_connected_at = GETUTCDATE() WHERE server_id = @p1", serverID)
+	configDB.Exec("UPDATE server_connections SET last_connected_at = GETUTCDATE() WHERE server_id = @p1", serverID)
 }
 
 func startSyncStatus(mappingID int, syncType, status string) int64 {
 	var statusID int64
-	err := destDB.QueryRow(`
+	err := configDB.QueryRow(`
 		INSERT INTO sync_status (mapping_id, sync_type, status, records_processed, records_failed, started_at)
 		OUTPUT INSERTED.status_id
 		VALUES (@p1, @p2, @p3, 0, 0, GETUTCDATE())
@@ -1125,14 +1242,14 @@ func startSyncStatus(mappingID int, syncType, status string) int64 {
 
 func updateSyncStatus(statusID int64, status string, processed, failed int64, errorMsg string) {
 	if errorMsg != "" {
-		destDB.Exec(`
+		configDB.Exec(`
 			UPDATE sync_status 
 			SET status = @p1, records_processed = @p2, records_failed = @p3, 
 			    completed_at = GETUTCDATE(), error_message = @p4
 			WHERE status_id = @p5
 		`, status, processed, failed, errorMsg, statusID)
 	} else {
-		destDB.Exec(`
+		configDB.Exec(`
 			UPDATE sync_status 
 			SET status = @p1, records_processed = @p2, records_failed = @p3, completed_at = GETUTCDATE()
 			WHERE status_id = @p4
@@ -1141,19 +1258,19 @@ func updateSyncStatus(statusID int64, status string, processed, failed int64, er
 }
 
 func updateLastProcessedPK(statusID int64, pkValue string) {
-	destDB.Exec("UPDATE sync_status SET last_processed_pk = @p1 WHERE status_id = @p2", pkValue, statusID)
+	configDB.Exec("UPDATE sync_status SET last_processed_pk = @p1 WHERE status_id = @p2", pkValue, statusID)
 }
 
 func updateLastLSN(mappingID int, lsn string) {
-	destDB.Exec("UPDATE table_mappings SET last_cdc_lsn = @p1 WHERE mapping_id = @p2", lsn, mappingID)
+	configDB.Exec("UPDATE table_mappings SET last_cdc_lsn = @p1 WHERE mapping_id = @p2", lsn, mappingID)
 }
 
 func updateLastFullSync(mappingID int) {
-	destDB.Exec("UPDATE table_mappings SET last_full_sync_at = GETUTCDATE() WHERE mapping_id = @p1", mappingID)
+	configDB.Exec("UPDATE table_mappings SET last_full_sync_at = GETUTCDATE() WHERE mapping_id = @p1", mappingID)
 }
 
 func logSync(mappingID int, level, message, syncType string, recordsCount int64, execTimeMs int) {
-	destDB.Exec(`
+	configDB.Exec(`
 		INSERT INTO sync_logs (mapping_id, log_level, log_message, sync_type, records_count, execution_time_ms)
 		VALUES (@p1, @p2, @p3, @p4, @p5, @p6)
 	`, mappingID, level, message, syncType, recordsCount, execTimeMs)
@@ -1165,15 +1282,15 @@ func logError(mappingID *int, serverID *int, errorType, message string, details 
 		detailsStr = fmt.Sprintf("%v", details)
 	}
 
-	destDB.Exec(`
+	configDB.Exec(`
 		INSERT INTO error_logs (mapping_id, server_id, error_type, error_message, error_details)
 		VALUES (@p1, @p2, @p3, @p4, @p5)
 	`, mappingID, serverID, errorType, message, detailsStr)
 }
 
-func logVerification(mappingID int, vType, sourceMD5, destMD5 string, 
+func logVerification(mappingID int, vType, sourceMD5, destMD5 string,
 	sourceCount, destCount, compared, mismatches int64, status, details string) {
-	destDB.Exec(`
+	configDB.Exec(`
 		INSERT INTO verification_logs 
 		(mapping_id, verification_type, source_md5, dest_md5, source_row_count, dest_row_count,
 		 records_compared, mismatches_found, verification_status, verification_details)
@@ -1187,4 +1304,3 @@ func getEnv(key, defaultValue string) string {
 	}
 	return defaultValue
 }
-
