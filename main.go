@@ -896,13 +896,13 @@ func applyDelete(db *sql.DB, mapping TableMapping, change map[string]interface{}
 }
 
 func isCDCEnabled(mapping TableMapping, db *sql.DB) bool {
-	var isCDCEnabled int
+	var isCDCEnabled bool
 	err := db.QueryRow(fmt.Sprintf("SELECT is_cdc_enabled FROM sys.databases WHERE name = '%s'", mapping.SourceDatabase)).Scan(&isCDCEnabled)
 	if err != nil {
 		log.Printf("Error checking CDC on database: %v", err)
 		return false
 	}
-	if isCDCEnabled == 0 {
+	if !isCDCEnabled {
 		log.Printf("CDC not enabled on database: %s", mapping.SourceDatabase)
 		return false
 	}
