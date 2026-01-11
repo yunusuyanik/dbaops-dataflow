@@ -511,10 +511,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputStr), "FULL_SYNC", 0, 0)
 		return
 	}
+	log.Printf("Full sync: Export completed successfully")
 
 	// 5. Create Temp View on Destination
 	// This ensures BCP 'in' only sees the columns we want to sync, in the correct order
 	viewName := fmt.Sprintf("v_bcp_sync_%d", mapping.MappingID)
+	log.Printf("Full sync: Creating temp view %s on destination...", viewName)
+	
 	createViewQuery := fmt.Sprintf("IF OBJECT_ID('%s.%s.%s', 'V') IS NOT NULL DROP VIEW [%s].[%s].[%s];",
 		mapping.DestDatabase, mapping.DestSchema, viewName,
 		mapping.DestDatabase, mapping.DestSchema, viewName)
@@ -525,10 +528,17 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	_, err = destDB.Exec(createViewQuery)
 	if err != nil {
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to create temp view: %v", err))
+		errorMsg := fmt.Sprintf("Failed to create temp view: %v", err)
+		updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+		logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
 		return
 	}
-	defer destDB.Exec(fmt.Sprintf("DROP VIEW [%s].[%s].[%s]", mapping.DestDatabase, mapping.DestSchema, viewName))
+	log.Printf("Full sync: Temp view %s created successfully", viewName)
+	defer func() {
+		if _, dropErr := destDB.Exec(fmt.Sprintf("DROP VIEW [%s].[%s].[%s]", mapping.DestDatabase, mapping.DestSchema, viewName)); dropErr != nil {
+			log.Printf("Warning: Failed to drop temp view %s: %v", viewName, dropErr)
+		}
+	}()
 
 	// 6. Temp File to Destination View (bcp in)
 	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
@@ -542,10 +552,12 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	cmdIn := exec.Command("sh", "-c", bcpInCmd)
 	if output, err := cmdIn.CombinedOutput(); err != nil {
 		outputStr := string(output)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP import failed: %v, output: %s", err, outputStr))
-		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP import failed: %v, output: %s", err, outputStr), "FULL_SYNC", 0, 0)
+		errorMsg := fmt.Sprintf("BCP import failed: %v, output: %s", err, outputStr)
+		updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+		logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
 		return
 	}
+	log.Printf("Full sync: Import completed successfully")
 
 	// Update flags
 	updateLastFullSync(mapping.MappingID)
