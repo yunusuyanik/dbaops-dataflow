@@ -89,8 +89,6 @@ func init() {
 	configDB.SetConnMaxLifetime(5 * time.Minute)
 
 	log.Println("Connected to configuration database")
-
-	// Load initial configuration
 	loadConfiguration()
 }
 
@@ -139,9 +137,6 @@ func loadConfiguration() {
 			retryDelay = time.Duration(seconds) * time.Second
 		}
 	}
-
-	log.Printf("Configuration loaded: CDC interval=%v, Verification interval=%v, Parallel workers=%d, Batch size=%d",
-		cdcInterval, verificationInterval, parallelWorkers, batchSize)
 }
 
 func getConfigValue(key string) string {
