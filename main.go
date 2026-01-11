@@ -1101,8 +1101,8 @@ func getEnabledMappings() ([]TableMapping, error) {
 		tm.cdc_enabled, 
 		tm.last_cdc_lsn, 
 		tm.last_full_sync_at,
-		CONCAT('server=', f.source_server, ';port=', CAST(f.source_port AS NVARCHAR), ';user id=', f.source_user, ';password=', f.source_password, ';encrypt=disable') AS source_conn_string,
-		CONCAT('server=', f.dest_server, ';port=', CAST(f.dest_port AS NVARCHAR), ';user id=', f.dest_user, ';password=', f.dest_password, ';encrypt=disable') AS dest_conn_string
+		CONCAT('server=', f.source_server, ';port=', CAST(f.source_port AS NVARCHAR), ';user id=', f.source_user, ';password=', f.source_password, ';database=', tm.source_database, ';encrypt=disable') AS source_conn_string,
+		CONCAT('server=', f.dest_server, ';port=', CAST(f.dest_port AS NVARCHAR), ';user id=', f.dest_user, ';password=', f.dest_password, ';database=', tm.dest_database, ';encrypt=disable') AS dest_conn_string
 	FROM table_mappings tm
 	INNER JOIN flows f ON tm.flow_id = f.flow_id
 	WHERE tm.is_enabled = 1 
