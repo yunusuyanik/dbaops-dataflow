@@ -1332,14 +1332,34 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	pkPlaceholders := make([]string, 0)
-	pkArgs := make([]interface{}, 0)
+	// Build IN clause values (limit to 1000 for safety)
+	// Go-MSSQL driver doesn't handle IN clause parameters well, so we use direct values
+	// PK values are safe (integer or string from our own database)
+	inValues := make([]string, 0)
 	for i, pkVal := range pkValues {
 		if i >= 1000 {
 			break
 		}
-		pkPlaceholders = append(pkPlaceholders, fmt.Sprintf("@p%d", i+1))
-		pkArgs = append(pkArgs, pkVal)
+		// Format value based on type
+		switch v := pkVal.(type) {
+		case string:
+			// Escape single quotes for SQL
+			escaped := strings.ReplaceAll(v, "'", "''")
+			inValues = append(inValues, fmt.Sprintf("'%s'", escaped))
+		case int, int32, int64:
+			inValues = append(inValues, fmt.Sprintf("%v", v))
+		case float32, float64:
+			inValues = append(inValues, fmt.Sprintf("%v", v))
+		default:
+			// Convert to string and escape
+			valStr := fmt.Sprintf("%v", v)
+			escaped := strings.ReplaceAll(valStr, "'", "''")
+			inValues = append(inValues, fmt.Sprintf("'%s'", escaped))
+		}
+	}
+
+	if len(inValues) == 0 {
+		return
 	}
 
 	sourceQuery := fmt.Sprintf(`
@@ -1349,10 +1369,10 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		ORDER BY %s
 	`, strings.Join(verifyCols, ", "),
 		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
-		mapping.PrimaryKeyColumn, strings.Join(pkPlaceholders, ", "),
+		mapping.PrimaryKeyColumn, strings.Join(inValues, ", "),
 		mapping.PrimaryKeyColumn)
 
-	sourceRows, err := sourceDB.Query(sourceQuery, pkArgs...)
+	sourceRows, err := sourceDB.Query(sourceQuery)
 	if err != nil {
 		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query source: %v", err), nil)
 		return
