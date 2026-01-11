@@ -455,22 +455,8 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	placeholders := make([]string, len(columns))
-	for i := range placeholders {
-		placeholders[i] = fmt.Sprintf("@p%d", i+1)
-	}
-	insertQuery := fmt.Sprintf(`
-		INSERT INTO [%s].[%s].[%s] (%s)
-		VALUES (%s)
-	`, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	log.Printf("INSERT Query: INSERT INTO [%s].[%s].[%s] (%s) VALUES (%s)",
-		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-	log.Printf("Columns count: %d, First 10 columns: %v", len(columns), columns[:min(10, len(columns))])
+	log.Printf("Bulk insert: %d columns, target: [%s].[%s].[%s]", len(columns), mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	log.Printf("Columns: %v", columns[:min(10, len(columns))])
 
 	configMu.RLock()
 	batchSizeLocal := batchSize
@@ -503,7 +489,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		recordsProcessed++
 
 		if len(batch) >= batchSizeLocal {
-			if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
+			if err := executeBatchInsert(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
 				recordsFailed += int64(len(batch))
 				logSync(mapping.MappingID, "ERROR",
 					fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
@@ -513,7 +499,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	if len(batch) > 0 {
-		if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
+		if err := executeBatchInsert(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
 			recordsFailed += int64(len(batch))
 			logSync(mapping.MappingID, "ERROR",
 				fmt.Sprintf("Final batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
@@ -795,7 +781,7 @@ func getTableColumns(db *sql.DB, database, schema, table string) ([]string, erro
 	return columns, nil
 }
 
-func executeBatchInsert(db *sql.DB, query string, columns []string, batch [][]interface{}) error {
+func executeBatchInsert(db *sql.DB, database, schema, table string, columns []string, batch [][]interface{}) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -806,30 +792,167 @@ func executeBatchInsert(db *sql.DB, query string, columns []string, batch [][]in
 	}
 	defer tx.Rollback()
 
-	for rowIdx, row := range batch {
-		args := make([]interface{}, len(row))
+	tempTableName := fmt.Sprintf("#temp_bulk_%d", time.Now().UnixNano())
+	
+	columnDefs, err := getColumnDefinitions(db, database, schema, table, columns)
+	if err != nil {
+		return fmt.Errorf("failed to get column definitions: %w", err)
+	}
+	
+	createTempTableQuery := fmt.Sprintf(`
+		CREATE TABLE %s (
+			%s
+		)
+	`, tempTableName, strings.Join(columnDefs, ", "))
+
+	if _, err := tx.Exec(createTempTableQuery); err != nil {
+		return fmt.Errorf("failed to create temp table: %w", err)
+	}
+
+	insertTempQuery := fmt.Sprintf(`
+		INSERT INTO %s (%s) VALUES %s
+	`, tempTableName, strings.Join(columns, ", "), buildValuesClause(len(columns), len(batch)))
+
+	args := make([]interface{}, 0, len(columns)*len(batch))
+	for _, row := range batch {
 		for i, val := range row {
 			if val == nil {
-				args[i] = nil
+				args = append(args, nil)
 			} else {
 				switch v := val.(type) {
 				case []byte:
-					args[i] = v
+					args = append(args, v)
 				default:
-					args[i] = val
+					args = append(args, val)
 				}
 			}
-		}
-		if _, err := tx.Exec(query, args...); err != nil {
-			if rowIdx == 0 {
-				log.Printf("First row insert failed. Column types: %v", getColumnTypes(row))
-				log.Printf("First row sample values (first 5): %v", getSampleValues(row, 5))
-			}
-			return fmt.Errorf("row insert failed: %w", err)
+			_ = i
 		}
 	}
 
+	if _, err := tx.Exec(insertTempQuery, args...); err != nil {
+		return fmt.Errorf("failed to insert into temp table: %w", err)
+	}
+
+	bulkInsertQuery := fmt.Sprintf(`
+		INSERT INTO [%s].[%s].[%s] (%s)
+		SELECT %s FROM %s
+	`, database, schema, table,
+		strings.Join(columns, ", "),
+		strings.Join(columns, ", "),
+		tempTableName)
+
+	if _, err := tx.Exec(bulkInsertQuery); err != nil {
+		return fmt.Errorf("failed to bulk insert: %w", err)
+	}
+
+	if _, err := tx.Exec(fmt.Sprintf("DROP TABLE %s", tempTableName)); err != nil {
+		log.Printf("Warning: failed to drop temp table: %v", err)
+	}
+
 	return tx.Commit()
+}
+
+func getColumnDefinitions(db *sql.DB, database, schema, table string, columns []string) ([]string, error) {
+	query := fmt.Sprintf(`
+		SELECT c.COLUMN_NAME, c.DATA_TYPE, c.CHARACTER_MAXIMUM_LENGTH, 
+		       c.NUMERIC_PRECISION, c.NUMERIC_SCALE, c.IS_NULLABLE
+		FROM INFORMATION_SCHEMA.COLUMNS c
+		WHERE c.TABLE_CATALOG = '%s'
+		AND c.TABLE_SCHEMA = '%s'
+		AND c.TABLE_NAME = '%s'
+		AND c.COLUMN_NAME IN ('%s')
+		ORDER BY c.ORDINAL_POSITION
+	`, database, schema, table, strings.Join(columns, "', '"))
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	colDefs := make([]string, 0, len(columns))
+	colMap := make(map[string]struct {
+		dataType           string
+		charMaxLength      sql.NullInt64
+		numericPrecision   sql.NullInt64
+		numericScale       sql.NullInt64
+		isNullable         string
+	})
+
+	for rows.Next() {
+		var colName, dataType, isNullable string
+		var charMaxLength, numericPrecision, numericScale sql.NullInt64
+		if err := rows.Scan(&colName, &dataType, &charMaxLength, &numericPrecision, &numericScale, &isNullable); err != nil {
+			return nil, err
+		}
+		colMap[colName] = struct {
+			dataType           string
+			charMaxLength      sql.NullInt64
+			numericPrecision   sql.NullInt64
+			numericScale       sql.NullInt64
+			isNullable         string
+		}{dataType, charMaxLength, numericPrecision, numericScale, isNullable}
+	}
+
+	for _, col := range columns {
+		def, ok := colMap[col]
+		if !ok {
+			return nil, fmt.Errorf("column %s not found", col)
+		}
+
+		var typeDef string
+		switch strings.ToUpper(def.dataType) {
+		case "VARCHAR", "NVARCHAR", "CHAR", "NCHAR":
+			if def.charMaxLength.Valid && def.charMaxLength.Int64 > 0 {
+				if def.charMaxLength.Int64 == -1 {
+					typeDef = fmt.Sprintf("[%s] %s(MAX)", col, def.dataType)
+				} else {
+					typeDef = fmt.Sprintf("[%s] %s(%d)", col, def.dataType, def.charMaxLength.Int64)
+				}
+			} else {
+				typeDef = fmt.Sprintf("[%s] %s", col, def.dataType)
+			}
+		case "DECIMAL", "NUMERIC":
+			if def.numericPrecision.Valid && def.numericScale.Valid {
+				typeDef = fmt.Sprintf("[%s] %s(%d,%d)", col, def.dataType, def.numericPrecision.Int64, def.numericScale.Int64)
+			} else {
+				typeDef = fmt.Sprintf("[%s] %s", col, def.dataType)
+			}
+		case "VARBINARY", "BINARY":
+			if def.charMaxLength.Valid && def.charMaxLength.Int64 > 0 {
+				if def.charMaxLength.Int64 == -1 {
+					typeDef = fmt.Sprintf("[%s] %s(MAX)", col, def.dataType)
+				} else {
+					typeDef = fmt.Sprintf("[%s] %s(%d)", col, def.dataType, def.charMaxLength.Int64)
+				}
+			} else {
+				typeDef = fmt.Sprintf("[%s] %s", col, def.dataType)
+			}
+		default:
+			typeDef = fmt.Sprintf("[%s] %s", col, def.dataType)
+		}
+
+		if strings.ToUpper(def.isNullable) == "NO" {
+			typeDef += " NOT NULL"
+		}
+
+		colDefs = append(colDefs, typeDef)
+	}
+
+	return colDefs, nil
+}
+
+func buildValuesClause(columnCount, rowCount int) string {
+	placeholders := make([]string, rowCount)
+	for i := 0; i < rowCount; i++ {
+		rowPlaceholders := make([]string, columnCount)
+		for j := 0; j < columnCount; j++ {
+			rowPlaceholders[j] = fmt.Sprintf("@p%d", i*columnCount+j+1)
+		}
+		placeholders[i] = fmt.Sprintf("(%s)", strings.Join(rowPlaceholders, ", "))
+	}
+	return strings.Join(placeholders, ", ")
 }
 
 func applyInsert(db *sql.DB, mapping TableMapping, change map[string]interface{}) error {
