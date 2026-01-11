@@ -30,6 +30,20 @@ var (
 	retryDelay      = 30 * time.Second
 )
 
+// Flow represents source-dest connection details
+type Flow struct {
+	FlowID       int
+	FlowName     string
+	SourceServer string
+	SourcePort   int
+	SourceUser   string
+	SourcePass   string
+	DestServer   string
+	DestPort     int
+	DestUser     string
+	DestPass     string
+}
+
 // TableMapping represents a source-dest table mapping
 type TableMapping struct {
 	MappingID            int
@@ -440,15 +454,18 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	`, strings.Join(columns, ", "),
 		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, mapping.PrimaryKeyColumn)
 
-	rows, err := sourceDB.Query(selectQuery)
+	// 1. Get flow details for BCP
+	flow, err := getFlowByID(mapping.FlowID)
 	if err != nil {
-		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
-		logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
-			fmt.Sprintf("Failed to query source: %v", err), nil)
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get flow details: %v", err))
 		return
 	}
-	defer rows.Close()
 
+	// 2. Prepare temp file
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("full_sync_%d_%d.dat", mapping.FlowID, mapping.MappingID))
+	defer os.Remove(tmpFile)
+
+	// 3. Truncate destination table
 	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	_, err = destDB.Exec(truncateQuery)
@@ -457,73 +474,43 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	log.Printf("Full sync: starting bulk insert for [%s].[%s].[%s]", mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	// 4. Source to Temp File (bcp queryout)
+	// Using -n (native) to avoid all formatting/type issues
+	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
+		strings.ReplaceAll(selectQuery, "\n", " "),
+		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
 
-	configMu.RLock()
-	batchSizeLocal := batchSize
-	configMu.RUnlock()
-
-	batch := make([][]interface{}, 0, batchSizeLocal)
-	var lastPKValue interface{}
-
-	for rows.Next() {
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			recordsFailed++
-			logSync(mapping.MappingID, "ERROR", fmt.Sprintf("Failed to scan row: %v", err), "FULL_SYNC", 0, 0)
-			continue
-		}
-
-		for i, col := range columns {
-			if strings.EqualFold(col, mapping.PrimaryKeyColumn) {
-				lastPKValue = values[i]
-				break
-			}
-		}
-
-		batch = append(batch, values)
-		recordsProcessed++
-
-		if len(batch) >= batchSizeLocal {
-			if err := executeBatchInsert(destDB, mapping.DestConnString, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
-				recordsFailed += int64(len(batch))
-				logSync(mapping.MappingID, "ERROR",
-					fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
-			}
-			batch = batch[:0]
-		}
+	log.Printf("Full sync: Exporting data from source server %s...", flow.SourceServer)
+	cmdOut := exec.Command("sh", "-c", bcpOutCmd)
+	if output, err := cmdOut.CombinedOutput(); err != nil {
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, string(output)))
+		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v", err), "FULL_SYNC", 0, 0)
+		return
 	}
 
-	if len(batch) > 0 {
-		if err := executeBatchInsert(destDB, mapping.DestConnString, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, columns, batch); err != nil {
-			recordsFailed += int64(len(batch))
-			logSync(mapping.MappingID, "ERROR",
-				fmt.Sprintf("Final batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
-		}
+	// 5. Temp File to Destination (bcp in)
+	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
+		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
+
+	log.Printf("Full sync: Importing data to destination server %s...", flow.DestServer)
+	cmdIn := exec.Command("sh", "-c", bcpInCmd)
+	if output, err := cmdIn.CombinedOutput(); err != nil {
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP import failed: %v, output: %s", err, string(output)))
+		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP import failed: %v", err), "FULL_SYNC", 0, 0)
+		return
 	}
 
+	// Update flags
 	configDB.Exec("UPDATE table_mappings SET is_full_sync = 0 WHERE mapping_id = @p1", mapping.MappingID)
-
 	updateLastFullSync(mapping.MappingID)
 
 	duration := time.Since(startTime)
-	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, recordsFailed, "")
-	
-	var lastPKStr string
-	if lastPKValue != nil {
-		lastPKStr = fmt.Sprintf("%v", lastPKValue)
-	}
-	updateLastProcessedPK(statusID, lastPKStr)
+	updateSyncStatus(statusID, "COMPLETED", 0, 0, "") // BCP doesn't easily give row counts here without parsing
 
 	logSync(mapping.MappingID, "INFO",
-		fmt.Sprintf("Full sync completed: %d processed, %d failed, duration: %v",
-			recordsProcessed, recordsFailed, duration),
-		"FULL_SYNC", recordsProcessed, int(duration.Milliseconds()))
+		fmt.Sprintf("Full sync completed via BCP-to-BCP, duration: %v", duration),
+		"FULL_SYNC", 0, int(duration.Milliseconds()))
 }
 
 func processCDC(mapping TableMapping, sourceDB *sql.DB) {
@@ -1343,6 +1330,17 @@ func updateSyncStatus(statusID int64, status string, processed, failed int64, er
 			WHERE status_id = @p4
 		`, status, processed, failed, statusID)
 	}
+}
+
+func getFlowByID(flowID int) (Flow, error) {
+	var f Flow
+	err := configDB.QueryRow(`
+		SELECT flow_id, flow_name, source_server, source_port, source_user, source_password,
+		       dest_server, dest_port, dest_user, dest_password
+		FROM flows WHERE flow_id = @p1`, flowID).Scan(
+		&f.FlowID, &f.FlowName, &f.SourceServer, &f.SourcePort, &f.SourceUser, &f.SourcePass,
+		&f.DestServer, &f.DestPort, &f.DestUser, &f.DestPass)
+	return f, err
 }
 
 func updateLastProcessedPK(statusID int64, pkValue string) {
