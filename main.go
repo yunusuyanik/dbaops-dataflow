@@ -531,13 +531,18 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	log.Printf("Full sync: Exporting data... Command: %s", bcpOutLog)
 
 	cmdOut := exec.Command("sh", "-c", bcpOutCmd)
-	if output, err := cmdOut.CombinedOutput(); err != nil {
-		outputStr := string(output)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, outputStr))
-		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputStr), "FULL_SYNC", 0, 0)
+	outputOut, err := cmdOut.CombinedOutput()
+	outputOutStr := string(outputOut)
+	if err != nil {
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr))
+		logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr), "FULL_SYNC", 0, 0)
 		return
 	}
-	log.Printf("Full sync: Export completed successfully")
+	
+	// Parse export output for row count
+	exportRows := parseBCPRowCount(outputOutStr)
+	log.Printf("Full sync: Export completed successfully - %d rows exported", exportRows)
+	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP export completed: %d rows", exportRows), "FULL_SYNC", exportRows, 0)
 
 	// 6. Temp File to Destination (bcp in) - Using format file
 	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -f "%s" -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
@@ -549,14 +554,26 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
 
 	cmdIn := exec.Command("sh", "-c", bcpInCmd)
-	if output, err := cmdIn.CombinedOutput(); err != nil {
-		outputStr := string(output)
-		errorMsg := fmt.Sprintf("BCP import failed: %v, output: %s", err, outputStr)
+	outputIn, err := cmdIn.CombinedOutput()
+	outputInStr := string(outputIn)
+	if err != nil {
+		errorMsg := fmt.Sprintf("BCP import failed: %v, output: %s", err, outputInStr)
 		updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
 		logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
 		return
 	}
-	log.Printf("Full sync: Import completed successfully")
+	
+	// Parse import output for row count
+	importRows := parseBCPRowCount(outputInStr)
+	log.Printf("Full sync: Import completed successfully - %d rows imported", importRows)
+	log.Printf("Full sync: BCP import output: %s", outputInStr)
+	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP import completed: %d rows", importRows), "FULL_SYNC", importRows, 0)
+	
+	// Verify row count matches
+	if exportRows > 0 && importRows != exportRows {
+		log.Printf("Full sync: WARNING - Row count mismatch! Exported: %d, Imported: %d", exportRows, importRows)
+		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Row count mismatch: exported %d, imported %d", exportRows, importRows), "FULL_SYNC", 0, 0)
+	}
 
 	// Update flags
 	updateLastFullSync(mapping.MappingID)
@@ -1521,6 +1538,26 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 	}
 
 	return nil
+}
+
+func parseBCPRowCount(output string) int64 {
+	// BCP output format: "Starting copy...\n...\nX rows copied.\n..."
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "rows copied") {
+			// Extract number from "X rows copied" or "X rows successfully bulk-copied"
+			parts := strings.Fields(line)
+			for i, part := range parts {
+				if (part == "rows" || part == "row") && i > 0 {
+					if count, err := strconv.ParseInt(parts[i-1], 10, 64); err == nil {
+						return count
+					}
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func updateLastFullSync(mappingID int) {
