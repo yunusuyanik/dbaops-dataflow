@@ -457,8 +457,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	log.Printf("Bulk insert: %d columns, target: [%s].[%s].[%s]", len(columns), mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
-	log.Printf("Columns: %v", columns[:min(10, len(columns))])
+	log.Printf("Full sync: starting bulk insert for [%s].[%s].[%s]", mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 
 	configMu.RLock()
 	batchSizeLocal := batchSize
@@ -826,8 +825,10 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 	user := extractUser(connStr)
 	password := extractPassword(connStr)
 
-	bcpCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -c -t"\t" -S %s -U %s -P %s -d %s -b 1000`,
+	bcpCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -c -t"\t" -S "%s" -U "%s" -P "%s" -d "%s" -b 1000`,
 		schema, table, tmpFile, server, user, password, database)
+
+	log.Printf("Executing BCP: bcp \"[%s].[%s]\" in ... -S \"%s\" -U \"%s\" -d \"%s\"", schema, table, server, user, database)
 
 	cmd := exec.Command("sh", "-c", bcpCmd)
 	output, err := cmd.CombinedOutput()
