@@ -843,37 +843,6 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 	return nil
 }
 
-func findBCPPath() string {
-	possiblePaths := []string{
-		"/opt/mssql-tools18/bin/bcp",
-		"/opt/mssql-tools/bin/bcp",
-		"/usr/local/bin/bcp",
-		"/usr/bin/bcp",
-	}
-
-	for _, path := range possiblePaths {
-		if _, err := os.Stat(path); err == nil {
-			cmd := exec.Command(path, "-v")
-			output, _ := cmd.CombinedOutput()
-			outputStr := string(output)
-			if strings.Contains(outputStr, "SQL Server") || strings.Contains(outputStr, "Microsoft") || strings.Contains(outputStr, "Copyright (C)") {
-				return path
-			}
-		}
-	}
-
-	if path, err := exec.LookPath("bcp"); err == nil {
-		cmd := exec.Command(path, "-v")
-		output, _ := cmd.CombinedOutput()
-		outputStr := string(output)
-		if strings.Contains(outputStr, "SQL Server") || strings.Contains(outputStr, "Microsoft") || strings.Contains(outputStr, "Copyright (C)") {
-			return path
-		}
-	}
-
-	return ""
-}
-
 func extractServer(connStr string) string {
 	parts := strings.Split(connStr, ";")
 	for _, part := range parts {
