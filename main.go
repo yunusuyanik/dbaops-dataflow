@@ -1217,7 +1217,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		for i, col := range destColumns {
 			val := values[i]
 			if b, ok := val.([]byte); ok {
-				row[col] = string(b)
+				row[col] = hex.EncodeToString(b)
 			} else {
 				row[col] = val
 			}
