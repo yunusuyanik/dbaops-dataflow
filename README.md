@@ -331,7 +331,7 @@ The service automatically performs MD5 verification every 5 minutes (default):
 ⚠️ **IMPORTANT**: 
 - Only READ operations are performed on source server
 - Only the full sync trigger column can be updated (and this is optional)
-- Source server credentials are stored in `source_servers` table - secure this database appropriately
+- Server credentials are stored in `server_connections` table - secure this database appropriately
 - Use encrypted connections when possible
 
 ## Performance
