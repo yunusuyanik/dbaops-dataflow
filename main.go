@@ -826,8 +826,13 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 	user := extractUser(connStr)
 	password := extractPassword(connStr)
 
-	bcpCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -c -t"\t" -S %s -U %s -P %s -d %s`,
-		database, schema, table, tmpFile, server, user, password, database)
+	bcpPath := findBCPPath()
+	if bcpPath == "" {
+		return fmt.Errorf("SQL Server BCP not found. Install mssql-tools package")
+	}
+
+	bcpCmd := fmt.Sprintf(`"%s" "[%s].[%s].[%s]" in "%s" -c -t"\t" -r"\n" -S %s -U %s -P %s -d %s -b 1000`,
+		bcpPath, database, schema, table, tmpFile, server, user, password, database)
 
 	cmd := exec.Command("sh", "-c", bcpCmd)
 	output, err := cmd.CombinedOutput()
@@ -836,6 +841,33 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 	}
 
 	return nil
+}
+
+func findBCPPath() string {
+	possiblePaths := []string{
+		"/opt/mssql-tools18/bin/bcp",
+		"/opt/mssql-tools/bin/bcp",
+		"/usr/local/bin/bcp",
+		"/usr/bin/bcp",
+		"bcp",
+	}
+
+	for _, path := range possiblePaths {
+		if path == "bcp" {
+			if _, err := exec.LookPath("bcp"); err == nil {
+				cmd := exec.Command("bcp", "-v")
+				output, _ := cmd.CombinedOutput()
+				if strings.Contains(string(output), "SQL Server") || strings.Contains(string(output), "Microsoft") {
+					return "bcp"
+				}
+			}
+		} else {
+			if _, err := os.Stat(path); err == nil {
+				return path
+			}
+		}
+	}
+	return ""
 }
 
 func extractServer(connStr string) string {
