@@ -386,26 +386,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	recordsProcessed := int64(0)
 	recordsFailed := int64(0)
 
-	selectQuery := fmt.Sprintf(`
-		SELECT * FROM [%s].[%s].[%s]
-		ORDER BY %s
-	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, mapping.PrimaryKeyColumn)
-
-	rows, err := sourceDB.Query(selectQuery)
-	if err != nil {
-		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
-		logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
-			fmt.Sprintf("Failed to query source: %v", err), nil)
-		return
-	}
-	defer rows.Close()
-
-	allColumns, err := rows.Columns()
-	if err != nil {
-		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
-		return
-	}
-
 	timestampColumns, err := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	if err != nil {
 		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get timestamp columns: %v", err), "FULL_SYNC", 0, 0)
@@ -416,16 +396,40 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		timestampMap[strings.ToLower(col)] = true
 	}
 
+	sourceCols, err := getTableColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
+	if err != nil {
+		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
+		logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
+			fmt.Sprintf("Failed to get source columns: %v", err), nil)
+		return
+	}
+
 	columns := make([]string, 0)
-	columnIndexMap := make(map[int]int)
-	colIdx := 0
-	for i, col := range allColumns {
+	for _, col := range sourceCols {
 		if !timestampMap[strings.ToLower(col)] {
 			columns = append(columns, col)
-			columnIndexMap[colIdx] = i
-			colIdx++
 		}
 	}
+
+	if len(columns) == 0 {
+		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, "No columns to sync (all are timestamp)")
+		return
+	}
+
+	selectQuery := fmt.Sprintf(`
+		SELECT %s FROM [%s].[%s].[%s]
+		ORDER BY %s
+	`, strings.Join(columns, ", "),
+		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, mapping.PrimaryKeyColumn)
+
+	rows, err := sourceDB.Query(selectQuery)
+	if err != nil {
+		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
+		logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
+			fmt.Sprintf("Failed to query source: %v", err), nil)
+		return
+	}
+	defer rows.Close()
 
 	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
