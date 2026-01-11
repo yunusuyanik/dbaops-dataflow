@@ -475,7 +475,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	// 4. Source to Temp File (bcp queryout)
-	// Using -n (native) to avoid all formatting/type issues
 	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
 		strings.ReplaceAll(selectQuery, "\n", " "),
 		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
@@ -492,15 +491,32 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// 5. Temp File to Destination (bcp in)
-	// Using 2-part name [schema].[table] with -d database to avoid BCP conflict
-	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
-		mapping.DestSchema, mapping.DestTable,
+	// 5. Create Temp View on Destination
+	// This ensures BCP 'in' only sees the columns we want to sync, in the correct order
+	viewName := fmt.Sprintf("v_bcp_sync_%d", mapping.MappingID)
+	createViewQuery := fmt.Sprintf("IF OBJECT_ID('%s.%s.%s', 'V') IS NOT NULL DROP VIEW [%s].[%s].[%s];",
+		mapping.DestDatabase, mapping.DestSchema, viewName,
+		mapping.DestDatabase, mapping.DestSchema, viewName)
+	createViewQuery += fmt.Sprintf(" EXEC('CREATE VIEW [%s].[%s].[%s] AS SELECT %s FROM [%s].[%s].[%s]')",
+		mapping.DestDatabase, mapping.DestSchema, viewName,
+		strings.Join(columns, ", "),
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+
+	_, err = destDB.Exec(createViewQuery)
+	if err != nil {
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to create temp view: %v", err))
+		return
+	}
+	defer destDB.Exec(fmt.Sprintf("DROP VIEW [%s].[%s].[%s]", mapping.DestDatabase, mapping.DestSchema, viewName))
+
+	// 6. Temp File to Destination View (bcp in)
+	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
+		mapping.DestDatabase, mapping.DestSchema, viewName,
 		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
 
-	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
-		mapping.DestSchema, mapping.DestTable, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
-	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
+	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
+		mapping.DestDatabase, mapping.DestSchema, viewName, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
+	log.Printf("Full sync: Importing data to view %s... Command: %s", viewName, bcpInLog)
 
 	cmdIn := exec.Command("sh", "-c", bcpInCmd)
 	if output, err := cmdIn.CombinedOutput(); err != nil {
