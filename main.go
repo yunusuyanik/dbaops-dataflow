@@ -391,9 +391,17 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get timestamp columns: %v", err), "FULL_SYNC", 0, 0)
 	}
 
-	timestampMap := make(map[string]bool)
+	identityColumns, err := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	if err != nil {
+		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get identity columns: %v", err), "FULL_SYNC", 0, 0)
+	}
+
+	excludeMap := make(map[string]bool)
 	for _, col := range timestampColumns {
-		timestampMap[strings.ToLower(col)] = true
+		excludeMap[strings.ToLower(col)] = true
+	}
+	for _, col := range identityColumns {
+		excludeMap[strings.ToLower(col)] = true
 	}
 
 	sourceCols, err := getTableColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
@@ -406,7 +414,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	columns := make([]string, 0)
 	for _, col := range sourceCols {
-		if !timestampMap[strings.ToLower(col)] {
+		if !excludeMap[strings.ToLower(col)] {
 			columns = append(columns, col)
 		}
 	}
@@ -696,6 +704,36 @@ func getTimestampColumns(db *sql.DB, database, schema, table string) ([]string, 
 		AND TABLE_SCHEMA = '%s'
 		AND TABLE_NAME = '%s'
 		AND DATA_TYPE IN ('timestamp', 'rowversion')
+	`, database, schema, table)
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, err
+		}
+		columns = append(columns, col)
+	}
+	return columns, nil
+}
+
+func getIdentityColumns(db *sql.DB, database, schema, table string) ([]string, error) {
+	query := fmt.Sprintf(`
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.COLUMNS c
+		INNER JOIN sys.tables t ON t.name = c.TABLE_NAME
+		INNER JOIN sys.schemas s ON s.schema_id = t.schema_id AND s.name = c.TABLE_SCHEMA
+		INNER JOIN sys.columns col ON col.object_id = t.object_id AND col.name = c.COLUMN_NAME
+		WHERE c.TABLE_CATALOG = '%s'
+		AND c.TABLE_SCHEMA = '%s'
+		AND c.TABLE_NAME = '%s'
+		AND COLUMNPROPERTY(col.object_id, col.name, 'IsIdentity') = 1
 	`, database, schema, table)
 
 	rows, err := db.Query(query)
