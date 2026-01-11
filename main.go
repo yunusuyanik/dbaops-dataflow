@@ -1515,6 +1515,11 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 		return fmt.Errorf("failed to write format file: %w", err)
 	}
 
+	// Debug: log first few lines of format file
+	if len(modifiedLines) > 0 {
+		log.Printf("Format file created: %d lines, version: %s, field count: %s", len(modifiedLines), modifiedLines[0], modifiedLines[1])
+	}
+
 	return nil
 }
 
