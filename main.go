@@ -1477,8 +1477,8 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 	// Field line format: Field# SQLType PrefixLength Length Terminator ServerColumnOrder ColumnName Collation
 	modifiedLines := make([]string, 0, len(lines))
 	modifiedLines = append(modifiedLines, lines[0]) // Version
-	
-	fieldCount := 0
+	modifiedLines = append(modifiedLines, lines[1]) // Field count (keep original)
+
 	for i := 2; i < len(lines); i++ {
 		line := lines[i]
 		if strings.TrimSpace(line) == "" {
@@ -1487,6 +1487,7 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 
 		parts := strings.Split(line, "\t")
 		if len(parts) < 7 {
+			modifiedLines = append(modifiedLines, line)
 			continue
 		}
 
@@ -1501,16 +1502,12 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 			// Map to source column order
 			parts[5] = fmt.Sprintf("%d", sourceColMap[colNameLower])
 			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
-			fieldCount++
 		} else {
 			// Column not in source, skip it
 			parts[5] = "0"
 			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
 		}
 	}
-	
-	// Update field count (number of fields that will be imported)
-	modifiedLines[1] = fmt.Sprintf("%d", fieldCount)
 
 	// Step 5: Write modified format file with proper line endings
 	output := strings.Join(modifiedLines, "\n") + "\n"
