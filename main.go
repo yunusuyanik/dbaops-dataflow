@@ -480,7 +480,10 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		strings.ReplaceAll(selectQuery, "\n", " "),
 		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
 
-	log.Printf("Full sync: Exporting data from source server %s...", flow.SourceServer)
+	bcpOutLog := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "****" -d "%s" -u`,
+		strings.ReplaceAll(selectQuery, "\n", " "), tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, mapping.SourceDatabase)
+	log.Printf("Full sync: Exporting data... Command: %s", bcpOutLog)
+
 	cmdOut := exec.Command("sh", "-c", bcpOutCmd)
 	if output, err := cmdOut.CombinedOutput(); err != nil {
 		outputStr := string(output)
@@ -490,12 +493,15 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	// 5. Temp File to Destination (bcp in)
-	// Added -E for identity columns just in case
-	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
-		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
+	// Using 2-part name [schema].[table] with -d database to avoid BCP conflict
+	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
+		mapping.DestSchema, mapping.DestTable,
 		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
 
-	log.Printf("Full sync: Importing data to destination server %s...", flow.DestServer)
+	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
+		mapping.DestSchema, mapping.DestTable, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
+	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
+
 	cmdIn := exec.Command("sh", "-c", bcpInCmd)
 	if output, err := cmdIn.CombinedOutput(); err != nil {
 		outputStr := string(output)
