@@ -804,6 +804,14 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 				switch v := val.(type) {
 				case []byte:
 					values[i] = hex.EncodeToString(v)
+				case time.Time:
+					values[i] = v.Format("2006-01-02 15:04:05.000")
+				case bool:
+					if v {
+						values[i] = "1"
+					} else {
+						values[i] = "0"
+					}
 				case string:
 					escaped := strings.ReplaceAll(v, "\t", " ")
 					escaped = strings.ReplaceAll(escaped, "\n", " ")
