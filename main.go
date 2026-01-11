@@ -28,35 +28,24 @@ var (
 	retryDelay      = 30 * time.Second
 )
 
-// ServerConnection represents a server connection (source or destination)
-type ServerConnection struct {
-	ServerID      int
-	ServerName    string
-	ServerType    string
-	ConnString    string
-	IsEnabled     bool
-	LastConnected *time.Time
-}
-
 // TableMapping represents a source-dest table mapping
 type TableMapping struct {
 	MappingID            int
-	SourceServerID       int
+	FlowID               int
 	SourceDatabase       string
 	SourceSchema         string
 	SourceTable          string
-	DestServerID          int
-	DestDatabase          string
-	DestSchema            string
-	DestTable             string
-	PrimaryKeyColumn      string
-	FullSyncTriggerCol    sql.NullString
-	IsEnabled             bool
-	CDCEnabled            bool
-	LastCDCLSN            sql.NullString
-	LastFullSyncAt        sql.NullTime
-	SourceConnString      string
-	DestConnString        string
+	DestDatabase         string
+	DestSchema           string
+	DestTable            string
+	PrimaryKeyColumn     string
+	FullSyncTriggerCol   sql.NullString
+	IsEnabled            bool
+	CDCEnabled           bool
+	LastCDCLSN           sql.NullString
+	LastFullSyncAt       sql.NullTime
+	SourceConnString     string
+	DestConnString       string
 }
 
 // SyncStatus represents current sync status
@@ -304,13 +293,13 @@ func processAllMappings() {
 func processMapping(mapping TableMapping) {
 	sourceDB, err := connectToServer(mapping.SourceConnString)
 	if err != nil {
-		logError(&mapping.MappingID, &mapping.SourceServerID, "CONNECTION",
+		logError(&mapping.MappingID, &mapping.FlowID, "CONNECTION",
 			fmt.Sprintf("Failed to connect to source server: %v", err), nil)
 		return
 	}
 	defer sourceDB.Close()
 
-	updateLastConnected(mapping.SourceServerID)
+	updateLastConnected(mapping.FlowID)
 
 	if needsFullSync(mapping, sourceDB) {
 		performFullSync(mapping, sourceDB)
@@ -396,7 +385,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	if !validateSchema(mapping, sourceDB) {
 		updateSyncStatus(statusID, "ERROR", 0, 0, "Schema validation failed")
-		logError(&mapping.MappingID, &mapping.SourceServerID, "SCHEMA", "Schema validation failed", nil)
+		logError(&mapping.MappingID, &mapping.FlowID, "SCHEMA", "Schema validation failed", nil)
 		return
 	}
 
@@ -405,7 +394,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
-		logError(&mapping.MappingID, &mapping.DestServerID, "CONNECTION",
+		logError(&mapping.MappingID, &mapping.FlowID, "CONNECTION",
 			fmt.Sprintf("Failed to connect to destination server: %v", err), nil)
 		return
 	}
@@ -429,7 +418,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	rows, err := sourceDB.Query(selectQuery)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
-		logError(&mapping.MappingID, &mapping.SourceServerID, "SYNC",
+		logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
 			fmt.Sprintf("Failed to query source: %v", err), nil)
 		return
 	}
@@ -491,13 +480,12 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		recordsProcessed++
 
 		if len(batch) >= batchSizeLocal {
-			if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
-				recordsFailed += int64(len(batch))
-				logSync(mapping.MappingID, "ERROR",
-					fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
-			}
-			batch = batch[:0]
+		if err := executeBatchInsert(destDB, insertQuery, columns, batch); err != nil {
+			recordsFailed += int64(len(batch))
+			logSync(mapping.MappingID, "ERROR",
+				fmt.Sprintf("Batch insert failed: %v", err), "FULL_SYNC", int64(len(batch)), 0)
 		}
+		batch = batch[:0]
 	}
 
 	if len(batch) > 0 {
@@ -558,7 +546,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	changes, err := getCDCChanges(mapping, sourceDB, lastLSN)
 	if err != nil {
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
-		logError(&mapping.MappingID, &mapping.SourceServerID, "CDC",
+		logError(&mapping.MappingID, &mapping.FlowID, "CDC",
 			fmt.Sprintf("Failed to get CDC changes: %v", err), nil)
 		return
 	}
@@ -1188,8 +1176,8 @@ func connectToServer(connString string) (*sql.DB, error) {
 	return db, nil
 }
 
-func updateLastConnected(serverID int) {
-	configDB.Exec("UPDATE server_connections SET last_connected_at = GETUTCDATE() WHERE server_id = @p1", serverID)
+func updateLastConnected(flowID int) {
+	configDB.Exec("UPDATE flows SET last_connected_at = GETUTCDATE() WHERE flow_id = @p1", flowID)
 }
 
 func startSyncStatus(mappingID int, syncType, status string) int64 {
@@ -1243,16 +1231,16 @@ func logSync(mappingID int, level, message, syncType string, recordsCount int64,
 	`, mappingID, level, message, syncType, recordsCount, execTimeMs)
 }
 
-func logError(mappingID *int, serverID *int, errorType, message string, details interface{}) {
+func logError(mappingID *int, flowID *int, errorType, message string, details interface{}) {
 	var detailsStr string
 	if details != nil {
 		detailsStr = fmt.Sprintf("%v", details)
 	}
 
 	configDB.Exec(`
-		INSERT INTO error_logs (mapping_id, server_id, error_type, error_message, error_details)
+		INSERT INTO error_logs (mapping_id, flow_id, error_type, error_message, error_details)
 		VALUES (@p1, @p2, @p3, @p4, @p5)
-	`, mappingID, serverID, errorType, message, detailsStr)
+	`, mappingID, flowID, errorType, message, detailsStr)
 }
 
 func logVerification(mappingID int, vType, sourceMD5, destMD5 string,
