@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -294,9 +295,9 @@ func processAllMappings() {
 				processMapping(mapping)
 			}
 		}()
-	}
+		}
 
-	for _, mapping := range mappings {
+		for _, mapping := range mappings {
 		jobs <- mapping
 	}
 	close(jobs)
@@ -554,7 +555,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	duration := time.Since(startTime)
 	updateSyncStatus(statusID, "COMPLETED", 0, 0, "")
 
-	logSync(mapping.MappingID, "INFO",
+	logSync(mapping.MappingID, "INFO", 
 		fmt.Sprintf("Full sync completed via BCP-to-BCP, duration: %v", duration),
 		"FULL_SYNC", 0, int(duration.Milliseconds()))
 }
@@ -609,7 +610,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	recordsFailed := int64(0)
 	var newLSN string
 
-	for _, change := range changes {
+		for _, change := range changes {
 		if lsnVal, ok := change["__$start_lsn"]; ok {
 			if lsnBytes, ok := lsnVal.([]byte); ok {
 				newLSN = hex.EncodeToString(lsnBytes)
@@ -619,7 +620,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 				newLSN = fmt.Sprintf("%v", lsnVal)
 			}
 		}
-
+		
 		var operation int
 		if opVal, ok := change["__$operation"]; ok {
 			switch v := opVal.(type) {
@@ -662,7 +663,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, recordsFailed, "")
 	
 	if recordsProcessed > 0 {
-		logSync(mapping.MappingID, "INFO",
+		logSync(mapping.MappingID, "INFO", 
 			fmt.Sprintf("CDC sync completed: %d processed, %d failed", recordsProcessed, recordsFailed),
 			"CDC", recordsProcessed, 0)
 	}
@@ -739,7 +740,7 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
 		if !excludeMap[strings.ToLower(col)] {
-			sourceColMap[strings.ToLower(col)] = true
+		sourceColMap[strings.ToLower(col)] = true
 		}
 	}
 
@@ -1146,11 +1147,50 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
+	// Get timestamp and identity columns to exclude from verification
+	timestampColsDest, _ := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	timestampColsSource, _ := getTimestampColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
+	identityColsDest, _ := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	identityColsSource, _ := getIdentityColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
+
+	excludeMap := make(map[string]bool)
+	for _, col := range timestampColsDest {
+		excludeMap[strings.ToLower(col)] = true
+	}
+	for _, col := range timestampColsSource {
+		excludeMap[strings.ToLower(col)] = true
+	}
+	for _, col := range identityColsDest {
+		excludeMap[strings.ToLower(col)] = true
+	}
+	for _, col := range identityColsSource {
+		excludeMap[strings.ToLower(col)] = true
+	}
+
+	// Get all columns first
+	destCols, err := getTableColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	if err != nil {
+		return
+	}
+
+	// Build column list excluding timestamp and identity
+	verifyCols := make([]string, 0)
+	for _, col := range destCols {
+		if !excludeMap[strings.ToLower(col)] {
+			verifyCols = append(verifyCols, col)
+		}
+	}
+
+	if len(verifyCols) == 0 {
+		return
+	}
+
 	query := fmt.Sprintf(`
-		SELECT TOP 10000 *
+		SELECT TOP 10000 %s
 		FROM [%s].[%s].[%s]
 		ORDER BY %s DESC
-	`, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
+	`, strings.Join(verifyCols, ", "),
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
 
 	destRows, err := destDB.Query(query)
 	if err != nil {
@@ -1211,11 +1251,12 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	sourceQuery := fmt.Sprintf(`
-		SELECT *
+		SELECT %s
 		FROM [%s].[%s].[%s]
 		WHERE %s IN (%s)
 		ORDER BY %s
-	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+	`, strings.Join(verifyCols, ", "),
+		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
 		mapping.PrimaryKeyColumn, strings.Join(pkPlaceholders, ", "),
 		mapping.PrimaryKeyColumn)
 
@@ -1245,7 +1286,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		for i, col := range sourceColumns {
 			val := values[i]
 			if b, ok := val.([]byte); ok {
-				row[col] = string(b)
+				row[col] = hex.EncodeToString(b)
 			} else {
 				row[col] = val
 			}
@@ -1284,20 +1325,22 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		status = "FAILED"
 	}
 
-	logVerification(mapping.MappingID, "MD5_COMPARISON", "", "",
+	logVerification(mapping.MappingID, "MD5_COMPARISON", "", "", 
 		int64(len(destData)), int64(len(sourceData)), compared, mismatches, status, "")
 
 	if mismatches > 0 {
-		logError(&mapping.MappingID, nil, "VERIFICATION",
+		logError(&mapping.MappingID, nil, "VERIFICATION", 
 			fmt.Sprintf("MD5 verification failed: %d mismatches out of %d compared", mismatches, compared), nil)
 	}
 }
 
 func calculateRowMD5(row map[string]interface{}) string {
+	// Sort keys for consistent hashing
 	keys := make([]string, 0, len(row))
 	for k := range row {
 		keys = append(keys, k)
 	}
+	sort.Strings(keys)
 
 	var sb strings.Builder
 	for _, k := range keys {
@@ -1564,7 +1607,7 @@ func logError(mappingID *int, flowID *int, errorType, message string, details in
 	`, mappingID, flowID, errorType, message, detailsStr)
 }
 
-func logVerification(mappingID int, vType, sourceMD5, destMD5 string,
+func logVerification(mappingID int, vType, sourceMD5, destMD5 string, 
 	sourceCount, destCount, compared, mismatches int64, status, details string) {
 	configDB.Exec(`
 		INSERT INTO verification_logs 
