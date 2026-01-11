@@ -831,7 +831,7 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 		return fmt.Errorf("SQL Server BCP not found. Install mssql-tools package")
 	}
 
-	bcpCmd := fmt.Sprintf(`"%s" "[%s].[%s].[%s]" in "%s" -c -t"\t" -r"\n" -S %s -U %s -P %s -d %s -b 1000`,
+	bcpCmd := fmt.Sprintf(`%s "[%s].[%s].[%s]" in "%s" -c -t"\t" -S %s -U %s -P %s -d %s -b 1000`,
 		bcpPath, database, schema, table, tmpFile, server, user, password, database)
 
 	cmd := exec.Command("sh", "-c", bcpCmd)
