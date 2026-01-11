@@ -1445,9 +1445,12 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 		return fmt.Errorf("failed to read base format file: %w", err)
 	}
 
-	lines := strings.Split(string(content), "\n")
+	// Normalize line endings and remove trailing newlines
+	contentStr := strings.ReplaceAll(string(content), "\r\n", "\n")
+	contentStr = strings.TrimRight(contentStr, "\n\r")
+	lines := strings.Split(contentStr, "\n")
 	if len(lines) < 3 {
-		return fmt.Errorf("invalid format file structure")
+		return fmt.Errorf("invalid format file structure: expected at least 3 lines, got %d", len(lines))
 	}
 
 	// Step 3: Get destination table columns in order
@@ -1474,8 +1477,8 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 	// Field line format: Field# SQLType PrefixLength Length Terminator ServerColumnOrder ColumnName Collation
 	modifiedLines := make([]string, 0, len(lines))
 	modifiedLines = append(modifiedLines, lines[0]) // Version
-	modifiedLines = append(modifiedLines, lines[1]) // Field count
-
+	
+	fieldCount := 0
 	for i := 2; i < len(lines); i++ {
 		line := lines[i]
 		if strings.TrimSpace(line) == "" {
@@ -1484,7 +1487,6 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 
 		parts := strings.Split(line, "\t")
 		if len(parts) < 7 {
-			modifiedLines = append(modifiedLines, line)
 			continue
 		}
 
@@ -1499,15 +1501,20 @@ func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sou
 			// Map to source column order
 			parts[5] = fmt.Sprintf("%d", sourceColMap[colNameLower])
 			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
+			fieldCount++
 		} else {
 			// Column not in source, skip it
 			parts[5] = "0"
 			modifiedLines = append(modifiedLines, strings.Join(parts, "\t"))
 		}
 	}
+	
+	// Update field count (number of fields that will be imported)
+	modifiedLines[1] = fmt.Sprintf("%d", fieldCount)
 
-	// Step 5: Write modified format file
-	if err := os.WriteFile(formatFile, []byte(strings.Join(modifiedLines, "\n")), 0644); err != nil {
+	// Step 5: Write modified format file with proper line endings
+	output := strings.Join(modifiedLines, "\n") + "\n"
+	if err := os.WriteFile(formatFile, []byte(output), 0644); err != nil {
 		return fmt.Errorf("failed to write format file: %w", err)
 	}
 
