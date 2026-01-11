@@ -849,24 +849,28 @@ func findBCPPath() string {
 		"/opt/mssql-tools/bin/bcp",
 		"/usr/local/bin/bcp",
 		"/usr/bin/bcp",
-		"bcp",
 	}
 
 	for _, path := range possiblePaths {
-		if path == "bcp" {
-			if _, err := exec.LookPath("bcp"); err == nil {
-				cmd := exec.Command("bcp", "-v")
-				output, _ := cmd.CombinedOutput()
-				if strings.Contains(string(output), "SQL Server") || strings.Contains(string(output), "Microsoft") {
-					return "bcp"
-				}
-			}
-		} else {
-			if _, err := os.Stat(path); err == nil {
+		if _, err := os.Stat(path); err == nil {
+			cmd := exec.Command(path, "-v")
+			output, _ := cmd.CombinedOutput()
+			outputStr := string(output)
+			if strings.Contains(outputStr, "SQL Server") || strings.Contains(outputStr, "Microsoft") || strings.Contains(outputStr, "Copyright (C)") {
 				return path
 			}
 		}
 	}
+
+	if path, err := exec.LookPath("bcp"); err == nil {
+		cmd := exec.Command(path, "-v")
+		output, _ := cmd.CombinedOutput()
+		outputStr := string(output)
+		if strings.Contains(outputStr, "SQL Server") || strings.Contains(outputStr, "Microsoft") || strings.Contains(outputStr, "Copyright (C)") {
+			return path
+		}
+	}
+
 	return ""
 }
 
