@@ -804,7 +804,7 @@ func executeBatchInsert(db *sql.DB, connStr, database, schema, table string, col
 			} else {
 				switch v := val.(type) {
 				case []byte:
-					values[i] = fmt.Sprintf("0x%x", v)
+					values[i] = hex.EncodeToString(v)
 				case string:
 					escaped := strings.ReplaceAll(v, "\t", " ")
 					escaped = strings.ReplaceAll(escaped, "\n", " ")
