@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -34,6 +35,9 @@ var (
 	// In-progress tracking
 	syncingMappings = make(map[int]bool)
 	syncingMu       sync.Mutex
+	
+	// Logging
+	logFile *os.File
 )
 
 // Flow represents source-dest connection details
@@ -84,7 +88,48 @@ type SyncStatus struct {
 	LastProcessedPK sql.NullString
 }
 
+func initLogging() error {
+	// Try /var/log/dbaops-dataflow first, fallback to ./logs
+	logDir := "/var/log/dbaops-dataflow"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		logDir = "./logs"
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			log.Printf("Warning: Failed to create log directory, using stdout only: %v", err)
+			log.SetOutput(os.Stdout)
+			log.SetFlags(log.LstdFlags | log.Lshortfile)
+			return nil
+		}
+	}
+
+	// Daily log file: dbaops-dataflow-YYYY-MM-DD.log
+	logFileName := fmt.Sprintf("dbaops-dataflow-%s.log", time.Now().Format("2006-01-02"))
+	logPath := filepath.Join(logDir, logFileName)
+
+	// Open log file (append mode)
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("Warning: Failed to open log file, using stdout only: %v", err)
+		log.SetOutput(os.Stdout)
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+		return nil
+	}
+
+	// Write to both stdout and file
+	multiWriter := io.MultiWriter(os.Stdout, file)
+	log.SetOutput(multiWriter)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	logFile = file
+	log.Printf("Logging initialized: %s", logPath)
+	return nil
+}
+
 func init() {
+	// Initialize logging first
+	if err := initLogging(); err != nil {
+		log.Printf("Warning: Logging initialization failed: %v", err)
+	}
+
 	configServer := getEnv("CONFIG_SERVER", "localhost")
 	configUser := getEnv("CONFIG_USER", "sa")
 	configPass := getEnv("CONFIG_PASS", "")
@@ -92,25 +137,29 @@ func init() {
 		log.Fatal("CONFIG_PASS environment variable required (only config DB credentials needed, source/dest are in flows table)")
 	}
 
+	log.Printf("Step 1: Connecting to configuration database (server=%s, user=%s)", configServer, configUser)
 	connStr := fmt.Sprintf("server=%s;user id=%s;password=%s;database=dbaops_dataflow;encrypt=disable",
 		configServer, configUser, configPass)
 	
 	var err error
 	configDB, err = sql.Open("sqlserver", connStr)
 	if err != nil {
-		log.Fatalf("Failed to connect to config database: %v", err)
+		log.Fatalf("Step 1 FAILED: Failed to open config database connection: %v", err)
 	}
 
+	log.Printf("Step 2: Pinging configuration database...")
 	if err := configDB.Ping(); err != nil {
-		log.Fatalf("Failed to ping config database: %v", err)
+		log.Fatalf("Step 2 FAILED: Failed to ping config database: %v", err)
 	}
 
 	configDB.SetMaxOpenConns(50)
 	configDB.SetMaxIdleConns(10)
 	configDB.SetConnMaxLifetime(5 * time.Minute)
 
-	log.Println("Connected to configuration database")
+	log.Printf("Step 3: Configuration database connection established successfully")
+	log.Printf("Step 4: Loading configuration from config table...")
 	loadConfiguration()
+	log.Printf("Step 5: Initialization complete")
 }
 
 func loadConfiguration() {
@@ -289,7 +338,7 @@ func verificationLoop() {
 						log.Printf("PANIC in performAllVerifications recovered: %v", r)
 					}
 				}()
-				performAllVerifications()
+			performAllVerifications()
 			}()
 			
 			configMu.RLock()
@@ -449,35 +498,47 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	logSync(mapping.MappingID, "INFO", "Full sync started", "FULL_SYNC", 0, 0)
 
 	if !validateSchema(mapping, sourceDB) {
+		log.Printf("[FULL_SYNC] Step 1 FAILED: Schema validation failed for mapping_id=%d", mapping.MappingID)
 		updateSyncStatus(statusID, "ERROR", 0, 0, "Schema validation failed")
 		logError(&mapping.MappingID, &mapping.FlowID, "SCHEMA", "Schema validation failed", nil)
 		return
 	}
 
+	log.Printf("[FULL_SYNC] Step 1 SUCCESS: Schema validation passed for mapping_id=%d", mapping.MappingID)
 	logSync(mapping.MappingID, "INFO", "Schema validation passed", "SCHEMA_CHECK", 0, 0)
 
+	log.Printf("[FULL_SYNC] Step 2: Connecting to destination server for mapping_id=%d...", mapping.MappingID)
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
+		log.Printf("[FULL_SYNC] Step 2 FAILED: Failed to connect to destination server for mapping_id=%d: %v", mapping.MappingID, err)
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
 		logError(&mapping.MappingID, &mapping.FlowID, "CONNECTION",
 			fmt.Sprintf("Failed to connect to destination server: %v", err), nil)
 		return
 	}
 	defer destDB.Close()
+	log.Printf("[FULL_SYNC] Step 2 SUCCESS: Connected to destination server for mapping_id=%d", mapping.MappingID)
 
+	log.Printf("[FULL_SYNC] Step 3: Switching to destination database [%s] for mapping_id=%d...", mapping.DestDatabase, mapping.MappingID)
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
+		log.Printf("[FULL_SYNC] Step 3 FAILED: Failed to switch to destination database for mapping_id=%d: %v", mapping.MappingID, err)
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
 		return
 	}
+	log.Printf("[FULL_SYNC] Step 3 SUCCESS: Switched to destination database [%s] for mapping_id=%d", mapping.DestDatabase, mapping.MappingID)
 
 	startTime := time.Now()
 	recordsProcessed := int64(0)
 	recordsFailed := int64(0)
 
+	log.Printf("[FULL_SYNC] Step 4: Getting identity columns for mapping_id=%d...", mapping.MappingID)
 	identityColumns, err := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	if err != nil {
+		log.Printf("[FULL_SYNC] Step 4 WARNING: Failed to get identity columns for mapping_id=%d: %v", mapping.MappingID, err)
 		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get identity columns: %v", err), "FULL_SYNC", 0, 0)
+	} else {
+		log.Printf("[FULL_SYNC] Step 4 SUCCESS: Found %d identity column(s) for mapping_id=%d", len(identityColumns), mapping.MappingID)
 	}
 
 	// Only exclude identity columns from SELECT (timestamp will be included)
@@ -486,13 +547,16 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		excludeMap[strings.ToLower(col)] = true
 	}
 
+	log.Printf("[FULL_SYNC] Step 5: Getting source table columns for mapping_id=%d...", mapping.MappingID)
 	sourceCols, err := getTableColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	if err != nil {
+		log.Printf("[FULL_SYNC] Step 5 FAILED: Failed to get source columns for mapping_id=%d: %v", mapping.MappingID, err)
 		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
 		logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
 			fmt.Sprintf("Failed to get source columns: %v", err), nil)
 		return
 	}
+	log.Printf("[FULL_SYNC] Step 5 SUCCESS: Found %d source column(s) for mapping_id=%d", len(sourceCols), mapping.MappingID)
 
 	columns := make([]string, 0)
 	// Ensure PrimaryKeyColumn is first
@@ -526,51 +590,66 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	`, strings.Join(columns, ", "),
 		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, mapping.PrimaryKeyColumn)
 
+	log.Printf("[FULL_SYNC] Step 6: Marking mapping_id=%d as processing (setting is_full_sync=0)...", mapping.MappingID)
 	// Mark as processing immediately to prevent re-triggering
 	configDB.Exec("UPDATE table_mappings SET is_full_sync = 0 WHERE mapping_id = @p1", mapping.MappingID)
 
+	log.Printf("[FULL_SYNC] Step 7: Getting flow details (flow_id=%d) for BCP operations...", mapping.FlowID)
 	// 1. Get flow details for BCP
 	flow, err := getFlowByID(mapping.FlowID)
 	if err != nil {
+		log.Printf("[FULL_SYNC] Step 7 FAILED: Failed to get flow details for mapping_id=%d: %v", mapping.MappingID, err)
 		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get flow details: %v", err))
 		return
 	}
+	log.Printf("[FULL_SYNC] Step 7 SUCCESS: Got flow details (source: %s:%d, dest: %s:%d) for mapping_id=%d",
+		flow.SourceServer, flow.SourcePort, flow.DestServer, flow.DestPort, mapping.MappingID)
 
 	// 2. Prepare temp file (no format file needed)
 	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("full_sync_%d_%d.dat", mapping.FlowID, mapping.MappingID))
+	log.Printf("[FULL_SYNC] Step 8: Preparing temporary file: %s for mapping_id=%d", tmpFile, mapping.MappingID)
 	defer os.Remove(tmpFile)
 
 	// 3. Truncate destination table
+	log.Printf("[FULL_SYNC] Step 9: Truncating destination table [%s].[%s].[%s] for mapping_id=%d...",
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.MappingID)
 	truncateQuery := fmt.Sprintf("TRUNCATE TABLE [%s].[%s].[%s]",
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	_, err = destDB.Exec(truncateQuery)
 	if err != nil {
+		log.Printf("[FULL_SYNC] Step 9 WARNING: Failed to truncate dest table for mapping_id=%d (may not exist): %v", mapping.MappingID, err)
 		logSync(mapping.MappingID, "WARNING",
 			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
+	} else {
+		log.Printf("[FULL_SYNC] Step 9 SUCCESS: Destination table truncated for mapping_id=%d", mapping.MappingID)
 	}
 
 	// 4. Source to Temp File (bcp queryout) - Native mode
+	log.Printf("[FULL_SYNC] Step 10: Starting BCP export from source server for mapping_id=%d...", mapping.MappingID)
 	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
 		strings.ReplaceAll(selectQuery, "\n", " "),
 		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
 
 	bcpOutLog := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "****" -d "%s" -u`,
 		strings.ReplaceAll(selectQuery, "\n", " "), tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, mapping.SourceDatabase)
-	log.Printf("Full sync: Exporting data... Command: %s", bcpOutLog)
+	log.Printf("[FULL_SYNC] Step 10: BCP export command: %s", bcpOutLog)
 
 	// Set timeout for BCP export (2 hours max)
 	ctxOut, cancelOut := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancelOut()
 	cmdOut := exec.CommandContext(ctxOut, "sh", "-c", bcpOutCmd)
 	
+	log.Printf("[FULL_SYNC] Step 10: Executing BCP export command for mapping_id=%d (timeout: 2 hours)...", mapping.MappingID)
 	outputOut, err := cmdOut.CombinedOutput()
 	outputOutStr := string(outputOut)
 	if err != nil {
 		if ctxOut.Err() == context.DeadlineExceeded {
 			errorMsg := "BCP export timeout after 2 hours"
+			log.Printf("[FULL_SYNC] Step 10 FAILED: %s for mapping_id=%d", errorMsg, mapping.MappingID)
 			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
 			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
 		} else {
+			log.Printf("[FULL_SYNC] Step 10 FAILED: BCP export failed for mapping_id=%d: %v, output: %s", mapping.MappingID, err, outputOutStr)
 			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr))
 			logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr), "FULL_SYNC", 0, 0)
 		}
@@ -579,32 +658,36 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	
 	// Parse export output for row count
 	exportRows := parseBCPRowCount(outputOutStr)
-	log.Printf("Full sync: Export completed successfully - %d rows exported", exportRows)
+	log.Printf("[FULL_SYNC] Step 10 SUCCESS: Export completed - %d rows exported for mapping_id=%d", exportRows, mapping.MappingID)
 	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP export completed: %d rows", exportRows), "FULL_SYNC", exportRows, 0)
 
 	// 5. Temp File to Destination (bcp in) - Native mode, no format file
+	log.Printf("[FULL_SYNC] Step 11: Starting BCP import to destination server for mapping_id=%d...", mapping.MappingID)
 	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable,
 		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSize)
 
 	bcpInLog := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "****" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable, tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, mapping.DestDatabase, batchSize)
-	log.Printf("Full sync: Importing data... Command: %s", bcpInLog)
+	log.Printf("[FULL_SYNC] Step 11: BCP import command: %s", bcpInLog)
 
 	// Set timeout for BCP import (2 hours max)
 	ctxIn, cancelIn := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancelIn()
 	cmdIn := exec.CommandContext(ctxIn, "sh", "-c", bcpInCmd)
 	
+	log.Printf("[FULL_SYNC] Step 11: Executing BCP import command for mapping_id=%d (timeout: 2 hours, batch_size: %d)...", mapping.MappingID, batchSize)
 	outputIn, err := cmdIn.CombinedOutput()
 	outputInStr := string(outputIn)
 	if err != nil {
 		if ctxIn.Err() == context.DeadlineExceeded {
 			errorMsg := "BCP import timeout after 2 hours"
+			log.Printf("[FULL_SYNC] Step 11 FAILED: %s for mapping_id=%d", errorMsg, mapping.MappingID)
 			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
 			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
 		} else {
 			errorMsg := fmt.Sprintf("BCP import failed: %v, output: %s", err, outputInStr)
+			log.Printf("[FULL_SYNC] Step 11 FAILED: BCP import failed for mapping_id=%d: %v, output: %s", mapping.MappingID, err, outputInStr)
 			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
 			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
 		}
@@ -613,22 +696,27 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	
 	// Parse import output for row count
 	importRows := parseBCPRowCount(outputInStr)
-	log.Printf("Full sync: Import completed successfully - %d rows imported", importRows)
-	log.Printf("Full sync: BCP import output: %s", outputInStr)
+	log.Printf("[FULL_SYNC] Step 11 SUCCESS: Import completed - %d rows imported for mapping_id=%d", importRows, mapping.MappingID)
+	log.Printf("[FULL_SYNC] Step 11: BCP import output: %s", outputInStr)
 	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP import completed: %d rows", importRows), "FULL_SYNC", importRows, 0)
 	
 	// Verify row count matches
 	if exportRows > 0 && importRows != exportRows {
-		log.Printf("Full sync: WARNING - Row count mismatch! Exported: %d, Imported: %d", exportRows, importRows)
+		log.Printf("[FULL_SYNC] Step 12 WARNING: Row count mismatch for mapping_id=%d! Exported: %d, Imported: %d", mapping.MappingID, exportRows, importRows)
 		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Row count mismatch: exported %d, imported %d", exportRows, importRows), "FULL_SYNC", 0, 0)
+	} else {
+		log.Printf("[FULL_SYNC] Step 12 SUCCESS: Row count verified - exported: %d, imported: %d for mapping_id=%d", exportRows, importRows, mapping.MappingID)
 	}
 
 	// Update flags
+	log.Printf("[FULL_SYNC] Step 13: Updating last_full_sync_at timestamp for mapping_id=%d...", mapping.MappingID)
 	updateLastFullSync(mapping.MappingID)
 
 	duration := time.Since(startTime)
 	updateSyncStatus(statusID, "COMPLETED", 0, 0, "")
 
+	log.Printf("[FULL_SYNC] COMPLETED: Full sync finished for mapping_id=%d, duration: %v, exported: %d rows, imported: %d rows",
+		mapping.MappingID, duration, exportRows, importRows)
 	logSync(mapping.MappingID, "INFO", 
 		fmt.Sprintf("Full sync completed via BCP-to-BCP, duration: %v", duration),
 		"FULL_SYNC", 0, int(duration.Milliseconds()))
