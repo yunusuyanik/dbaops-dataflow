@@ -248,7 +248,7 @@ func main() {
 
 	close(stopChan)
 	wg.Wait()
-	
+
 	configDB.Close()
 	if logFile != nil {
 		logFile.Close()
@@ -359,7 +359,7 @@ func verificationLoop() {
 						log.Printf("[VERIFICATION_LOOP] PANIC in performAllVerifications recovered: %v", r)
 					}
 				}()
-			performAllVerifications()
+				performAllVerifications()
 			}()
 
 			configMu.RLock()
@@ -415,9 +415,9 @@ func processAllMappings() {
 				processMapping(mapping)
 			}
 		}(i)
-		}
+	}
 
-		for _, mapping := range mappings {
+	for _, mapping := range mappings {
 		jobs <- mapping
 	}
 	close(jobs)
@@ -481,7 +481,24 @@ func performAllVerifications() {
 		return
 	}
 
-	log.Printf("[VERIFICATION] Found %d enabled mapping(s) to verify", len(mappings))
+	// Filter out mappings that are currently running full sync
+	filteredMappings := make([]TableMapping, 0)
+	syncingMu.Lock()
+	for _, mapping := range mappings {
+		if syncingMappings[mapping.MappingID] {
+			log.Printf("[VERIFICATION] Skipping mapping_id=%d - full sync in progress", mapping.MappingID)
+			continue
+		}
+		filteredMappings = append(filteredMappings, mapping)
+	}
+	syncingMu.Unlock()
+
+	if len(filteredMappings) == 0 {
+		log.Printf("[VERIFICATION] No mappings available for verification (all are in full sync), skipping...")
+		return
+	}
+
+	log.Printf("[VERIFICATION] Found %d enabled mapping(s) to verify (filtered %d in full sync)", len(filteredMappings), len(mappings)-len(filteredMappings))
 
 	configMu.RLock()
 	workers := parallelWorkers
@@ -517,7 +534,7 @@ func performAllVerifications() {
 		}(i)
 	}
 
-	for _, mapping := range mappings {
+	for _, mapping := range filteredMappings {
 		jobs <- mapping
 	}
 	close(jobs)
@@ -1105,9 +1122,9 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, 0, "")
 
 	log.Printf("[CDC] mapping_id=%d: COMPLETED - CDC sync finished: %d rows processed", mapping.MappingID, recordsProcessed)
-		logSync(mapping.MappingID, "INFO", 
+	logSync(mapping.MappingID, "INFO",
 		fmt.Sprintf("CDC sync completed: %d rows processed", recordsProcessed),
-			"CDC", recordsProcessed, 0)
+		"CDC", recordsProcessed, 0)
 }
 
 func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
@@ -1181,7 +1198,7 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
 		if !excludeMap[strings.ToLower(col)] {
-		sourceColMap[strings.ToLower(col)] = true
+			sourceColMap[strings.ToLower(col)] = true
 		}
 	}
 
@@ -1500,7 +1517,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1529,7 +1546,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		}
 		return ""
 	}
-	
+
 	return hex.EncodeToString(lsn)
 }
 
@@ -1582,7 +1599,7 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1709,7 +1726,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Query last 10k rows from destination (excluding timestamp/identity columns)
+	// Query last 10 rows from destination (excluding timestamp/identity columns)
 	// Ensure primary key column is included for comparison
 	verifyColsWithPK := make([]string, 0)
 	pkIncluded := false
@@ -1722,14 +1739,16 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	if !pkIncluded {
 		verifyColsWithPK = append([]string{mapping.PrimaryKeyColumn}, verifyColsWithPK...)
 	}
-
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Querying last 10,000 rows from destination...", mapping.MappingID)
+	
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Querying last 10 rows from destination...", mapping.MappingID)
 	destQuery := fmt.Sprintf(`
-		SELECT TOP 10000 %s
+		SELECT TOP 10 %s
 		FROM [%s].[%s].[%s]
 		ORDER BY %s DESC
 	`, strings.Join(verifyColsWithPK, ", "),
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
+	
+	log.Printf("[VERIFICATION] mapping_id=%d: Destination Query: %s", mapping.MappingID, destQuery)
 
 	destRows, err := destDB.Query(destQuery)
 	if err != nil {
@@ -1772,7 +1791,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 - Found %d rows in destination, extracting primary key values...", mapping.MappingID, len(destData))
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 - Found %d rows in destination, extracting primary key values...", mapping.MappingID, len(destData))
 	pkValues := make([]interface{}, 0)
 	for _, row := range destData {
 		if pkVal, ok := row[mapping.PrimaryKeyColumn]; ok {
@@ -1785,16 +1804,13 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 SUCCESS - Extracted %d primary key values", mapping.MappingID, len(pkValues))
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 SUCCESS - Extracted %d primary key values", mapping.MappingID, len(pkValues))
 
-	// Build IN clause values (limit to 1000 for safety)
+	// Build IN clause values for the PKs we found
 	// Go-MSSQL driver doesn't handle IN clause parameters well, so we use direct values
 	// PK values are safe (integer or string from our own database)
 	inValues := make([]string, 0)
-	for i, pkVal := range pkValues {
-		if i >= 1000 {
-			break
-		}
+	for _, pkVal := range pkValues {
 		// Format value based on type
 		switch v := pkVal.(type) {
 		case string:
@@ -1817,14 +1833,18 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Query same last 10k rows from source
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 - Querying last 10,000 rows from source...", mapping.MappingID)
+	// Query same rows from source using PK IN clause
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 - Querying matching rows from source using PK IN clause...", mapping.MappingID)
 	sourceQuery := fmt.Sprintf(`
-		SELECT TOP 10000 %s
+		SELECT %s
 		FROM [%s].[%s].[%s]
+		WHERE %s IN (%s)
 		ORDER BY %s DESC
 	`, strings.Join(verifyColsWithPK, ", "),
-		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, mapping.PrimaryKeyColumn)
+		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+		mapping.PrimaryKeyColumn, strings.Join(inValues, ", "), mapping.PrimaryKeyColumn)
+	
+	log.Printf("[VERIFICATION] mapping_id=%d: Source Query: %s", mapping.MappingID, sourceQuery)
 	sourceRows, err := sourceDB.Query(sourceQuery)
 	if err != nil {
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 FAILED - Failed to query source: %v", mapping.MappingID, err)
@@ -1832,7 +1852,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 	defer sourceRows.Close()
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 6 SUCCESS - Queried source table", mapping.MappingID)
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 SUCCESS - Queried source table", mapping.MappingID)
 
 	sourceColumns, _ := sourceRows.Columns()
 	sourceData := make(map[interface{}]map[string]interface{})
@@ -1869,7 +1889,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	// Calculate combined MD5 for all rows
 	log.Printf("[VERIFICATION] mapping_id=%d: Step 7 - Calculating combined MD5 hashes...", mapping.MappingID)
 	destCombinedMD5 := calculateRowsMD5(destData)
-	
+
 	// Convert sourceData map to slice for MD5 calculation
 	sourceDataSlice := make([]map[string]interface{}, 0, len(sourceData))
 	for _, row := range sourceData {
@@ -1914,7 +1934,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		int64(len(destData)), int64(len(sourceData)), compared, mismatches, status, "")
 
 	if mismatches > 0 {
-		logError(&mapping.MappingID, nil, "VERIFICATION", 
+		logError(&mapping.MappingID, nil, "VERIFICATION",
 			fmt.Sprintf("MD5 verification failed: %d mismatches out of %d compared", mismatches, compared), nil)
 	}
 }
@@ -2031,7 +2051,7 @@ func startSyncStatus(mappingID int, syncType, status string) int64 {
 		OUTPUT INSERTED.status_id
 		VALUES (@p1, @p2, @p3, 0, 0, GETUTCDATE())
 	`, mappingID, syncType, status).Scan(&statusID)
-	
+
 	if err != nil {
 		log.Printf("Failed to create sync status: %v", err)
 		return 0
@@ -2256,7 +2276,7 @@ func logError(mappingID *int, flowID *int, errorType, message string, details in
 	`, mappingID, flowID, errorType, message, detailsStr)
 }
 
-func logVerification(mappingID int, vType, sourceMD5, destMD5 string, 
+func logVerification(mappingID int, vType, sourceMD5, destMD5 string,
 	sourceCount, destCount, compared, mismatches int64, status, details string) {
 	configDB.Exec(`
 		INSERT INTO verification_logs 
