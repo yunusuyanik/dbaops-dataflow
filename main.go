@@ -457,9 +457,13 @@ func processMapping(mapping TableMapping) {
 	updateLastConnected(mapping.FlowID)
 
 	if needsFullSync(mapping) {
+		log.Printf("[SYNC] mapping_id=%d: Full sync requested (is_full_sync=1), performing full table copy...", mapping.MappingID)
 		performFullSync(mapping, sourceDB)
 	} else if mapping.CDCEnabled {
+		log.Printf("[SYNC] mapping_id=%d: CDC enabled, checking for CDC changes (last_lsn: %s)...", mapping.MappingID, mapping.LastCDCLSN.String)
 		processCDC(mapping, sourceDB)
+	} else {
+		log.Printf("[SYNC] mapping_id=%d: No action needed (is_full_sync=0, cdc_enabled=0)", mapping.MappingID)
 	}
 }
 
@@ -860,15 +864,19 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	if newLSN != "" {
+		log.Printf("[CDC] mapping_id=%d: Updating last LSN to: %s", mapping.MappingID, newLSN)
 		updateLastLSN(mapping.MappingID, newLSN)
 	}
 
 	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, recordsFailed, "")
 	
 	if recordsProcessed > 0 {
+		log.Printf("[CDC] mapping_id=%d: CDC sync completed - %d processed, %d failed", mapping.MappingID, recordsProcessed, recordsFailed)
 		logSync(mapping.MappingID, "INFO", 
 			fmt.Sprintf("CDC sync completed: %d processed, %d failed", recordsProcessed, recordsFailed),
 			"CDC", recordsProcessed, 0)
+	} else {
+		log.Printf("[CDC] mapping_id=%d: CDC sync completed - no records processed", mapping.MappingID)
 	}
 }
 
