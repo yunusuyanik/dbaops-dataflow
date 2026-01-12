@@ -1383,15 +1383,21 @@ func getMaxLSN(mapping TableMapping, db *sql.DB) string {
 }
 
 func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[string]interface{}, error) {
-	var captureInstance sql.NullString
+	// Get CDC table name from cdc.change_tables by joining with sys.tables
 	query := fmt.Sprintf(`
-		SELECT capture_instance 
-		FROM cdc.change_tables 
-		WHERE source_object_id = OBJECT_ID('[%s].[%s].[%s]')
+		SELECT t.name AS cdc_table_name
+		FROM cdc.change_tables ct
+		INNER JOIN sys.tables t ON t.object_id = ct.object_id
+		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	
-	if err := db.QueryRow(query).Scan(&captureInstance); err != nil || !captureInstance.Valid {
-		return nil, fmt.Errorf("CDC capture instance not found for table")
+	var cdcTableName sql.NullString
+	err := db.QueryRow(query).Scan(&cdcTableName)
+	if err != nil {
+		return nil, fmt.Errorf("CDC table name not found for table: %v", err)
+	}
+	if !cdcTableName.Valid || cdcTableName.String == "" {
+		return nil, fmt.Errorf("CDC table name is NULL for table")
 	}
 
 	lsnBytes, err := hex.DecodeString(lastLSN)
@@ -1399,15 +1405,13 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 		return nil, fmt.Errorf("invalid LSN format: %v", err)
 	}
 
-	// CDC tables are typically named as <capture_instance>_CT
-	cdcTableName := captureInstance.String + "_CT"
 	cdcQuery := fmt.Sprintf(`
 		DECLARE @from_lsn BINARY(10) = @p1
 		SELECT *
 		FROM cdc.[%s]
 		WHERE __$start_lsn > @from_lsn
 		ORDER BY __$start_lsn, __$seqval
-	`, cdcTableName)
+	`, cdcTableName.String)
 
 	rows, err := db.Query(cdcQuery, lsnBytes)
 	if err != nil {
