@@ -546,6 +546,18 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	logSync(mapping.MappingID, "INFO", "Full sync started", "FULL_SYNC", 0, 0)
 
+	// Get and save minimum LSN before full sync (so CDC can continue from correct point after full sync)
+	if mapping.CDCEnabled {
+		log.Printf("[FULL_SYNC] mapping_id=%d: CDC enabled, getting minimum LSN before full sync...", mapping.MappingID)
+		minLSN := getMinLSN(mapping, sourceDB)
+		if minLSN != "" {
+			log.Printf("[FULL_SYNC] mapping_id=%d: Saving minimum LSN: %s", mapping.MappingID, minLSN)
+			updateLastLSN(mapping.MappingID, minLSN)
+		} else {
+			log.Printf("[FULL_SYNC] mapping_id=%d: WARNING - Could not get minimum LSN (CDC may not be enabled on table)", mapping.MappingID)
+		}
+	}
+
 	if !validateSchema(mapping, sourceDB) {
 		log.Printf("[FULL_SYNC] Step 1 FAILED: Schema validation failed for mapping_id=%d", mapping.MappingID)
 		updateSyncStatus(statusID, "ERROR", 0, 0, "Schema validation failed")
@@ -1423,22 +1435,65 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	if len(verifyCols) == 0 {
+		log.Printf("[VERIFICATION] mapping_id=%d: No columns to verify (all are timestamp/identity), skipping", mapping.MappingID)
 		return
 	}
 
+	// Get last ID from destination
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Getting last primary key value from destination...", mapping.MappingID)
+	lastIDQuery := fmt.Sprintf(`
+		SELECT TOP 1 %s
+		FROM [%s].[%s].[%s]
+		ORDER BY %s DESC
+	`, mapping.PrimaryKeyColumn,
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
+
+	var lastID interface{}
+	err = destDB.QueryRow(lastIDQuery).Scan(&lastID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - No data in destination table, skipping verification", mapping.MappingID)
+			return
+		}
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 3 FAILED - Failed to get last ID from destination: %v", mapping.MappingID, err)
+		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to get last ID from dest: %v", err), nil)
+		return
+	}
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 SUCCESS - Last primary key value: %v", mapping.MappingID, lastID)
+
+	// Format lastID for SQL query
+	var lastIDStr string
+	switch v := lastID.(type) {
+	case string:
+		escaped := strings.ReplaceAll(v, "'", "''")
+		lastIDStr = fmt.Sprintf("'%s'", escaped)
+	case int, int32, int64, float32, float64:
+		lastIDStr = fmt.Sprintf("%v", v)
+	default:
+		valStr := fmt.Sprintf("%v", v)
+		escaped := strings.ReplaceAll(valStr, "'", "''")
+		lastIDStr = fmt.Sprintf("'%s'", escaped)
+	}
+
+	// Query last 10k rows before last ID (including last ID)
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 - Querying last 10,000 rows (<= %v) from destination...", mapping.MappingID, lastID)
 	query := fmt.Sprintf(`
 		SELECT TOP 10000 %s
 		FROM [%s].[%s].[%s]
+		WHERE %s <= %s
 		ORDER BY %s DESC
 	`, strings.Join(verifyCols, ", "),
-		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
+		mapping.PrimaryKeyColumn, lastIDStr, mapping.PrimaryKeyColumn)
 
 	destRows, err := destDB.Query(query)
 	if err != nil {
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 4 FAILED - Failed to query destination: %v", mapping.MappingID, err)
 		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query dest: %v", err), nil)
 		return
 	}
 	defer destRows.Close()
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 SUCCESS - Queried destination table", mapping.MappingID)
 
 	destColumns, _ := destRows.Columns()
 	destData := make([]map[string]interface{}, 0)
@@ -1471,7 +1526,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 - Found %d rows in destination, extracting primary key values...", mapping.MappingID, len(destData))
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 - Found %d rows in destination, extracting primary key values...", mapping.MappingID, len(destData))
 	pkValues := make([]interface{}, 0)
 	for _, row := range destData {
 		if pkVal, ok := row[mapping.PrimaryKeyColumn]; ok {
@@ -1484,7 +1539,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 SUCCESS - Extracted %d primary key values", mapping.MappingID, len(pkValues))
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 SUCCESS - Extracted %d primary key values", mapping.MappingID, len(pkValues))
 
 	// Build IN clause values (limit to 1000 for safety)
 	// Go-MSSQL driver doesn't handle IN clause parameters well, so we use direct values
@@ -1516,25 +1571,27 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
+	// Query source with same last ID constraint
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 6 - Querying source table for rows <= %v (matching %d primary key values)...", mapping.MappingID, lastID, len(inValues))
+
 	sourceQuery := fmt.Sprintf(`
 		SELECT %s
 		FROM [%s].[%s].[%s]
-		WHERE %s IN (%s)
+		WHERE %s <= %s AND %s IN (%s)
 		ORDER BY %s
 	`, strings.Join(verifyCols, ", "),
 		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+		mapping.PrimaryKeyColumn, lastIDStr,
 		mapping.PrimaryKeyColumn, strings.Join(inValues, ", "),
 		mapping.PrimaryKeyColumn)
-
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 - Querying source table for %d primary key values...", mapping.MappingID, len(inValues))
 	sourceRows, err := sourceDB.Query(sourceQuery)
 	if err != nil {
-		log.Printf("[VERIFICATION] mapping_id=%d: Step 5 FAILED - Failed to query source: %v", mapping.MappingID, err)
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 FAILED - Failed to query source: %v", mapping.MappingID, err)
 		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query source: %v", err), nil)
 		return
 	}
 	defer sourceRows.Close()
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 SUCCESS - Queried source table", mapping.MappingID)
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 6 SUCCESS - Queried source table", mapping.MappingID)
 
 	sourceColumns, _ := sourceRows.Columns()
 	sourceData := make(map[interface{}]map[string]interface{})
