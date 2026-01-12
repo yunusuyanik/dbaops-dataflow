@@ -21,21 +21,21 @@ import (
 )
 
 var (
-	configDB        *sql.DB
-	stopChan        = make(chan struct{})
-	wg              sync.WaitGroup
-	configMu        sync.RWMutex
-	cdcInterval     = 10 * time.Second
+	configDB             *sql.DB
+	stopChan             = make(chan struct{})
+	wg                   sync.WaitGroup
+	configMu             sync.RWMutex
+	cdcInterval          = 10 * time.Second
 	verificationInterval = 5 * time.Minute
-	parallelWorkers = 5
-	batchSize       = 1000
-	maxRetryAttempts = 3
-	retryDelay      = 30 * time.Second
+	parallelWorkers      = 5
+	batchSize            = 1000
+	maxRetryAttempts     = 3
+	retryDelay           = 30 * time.Second
 
 	// In-progress tracking
 	syncingMappings = make(map[int]bool)
 	syncingMu       sync.Mutex
-	
+
 	// Logging
 	logFile *os.File
 )
@@ -56,37 +56,37 @@ type Flow struct {
 
 // TableMapping represents a source-dest table mapping
 type TableMapping struct {
-	MappingID            int
-	FlowID               int
-	SourceDatabase       string
-	SourceSchema         string
-	SourceTable          string
-	DestDatabase         string
-	DestSchema           string
-	DestTable            string
-	PrimaryKeyColumn     string
-	IsFullSync           bool
-	IsEnabled            bool
-	CDCEnabled           bool
-	LastCDCLSN           sql.NullString
-	LastFullSyncAt       sql.NullTime
-	LastCDCSyncAt        sql.NullTime
-	SourceConnString     string
-	DestConnString       string
+	MappingID        int
+	FlowID           int
+	SourceDatabase   string
+	SourceSchema     string
+	SourceTable      string
+	DestDatabase     string
+	DestSchema       string
+	DestTable        string
+	PrimaryKeyColumn string
+	IsFullSync       bool
+	IsEnabled        bool
+	CDCEnabled       bool
+	LastCDCLSN       sql.NullString
+	LastFullSyncAt   sql.NullTime
+	LastCDCSyncAt    sql.NullTime
+	SourceConnString string
+	DestConnString   string
 }
 
 // SyncStatus represents current sync status
 type SyncStatus struct {
-	StatusID        int64
-	MappingID       int
-	SyncType        string
-	Status          string
+	StatusID         int64
+	MappingID        int
+	SyncType         string
+	Status           string
 	RecordsProcessed int64
-	RecordsFailed   int64
-	StartedAt       time.Time
-	CompletedAt     sql.NullTime
-	ErrorMessage    sql.NullString
-	LastProcessedPK sql.NullString
+	RecordsFailed    int64
+	StartedAt        time.Time
+	CompletedAt      sql.NullTime
+	ErrorMessage     sql.NullString
+	LastProcessedPK  sql.NullString
 }
 
 func initLogging() error {
@@ -141,7 +141,7 @@ func init() {
 	log.Printf("Step 1: Connecting to configuration database (server=%s, user=%s)", configServer, configUser)
 	connStr := fmt.Sprintf("server=%s;user id=%s;password=%s;database=dbaops_dataflow;encrypt=disable",
 		configServer, configUser, configPass)
-	
+
 	var err error
 	configDB, err = sql.Open("sqlserver", connStr)
 	if err != nil {
@@ -309,7 +309,7 @@ func syncLoop() {
 				}()
 				processAllMappings()
 			}()
-			
+
 			configMu.RLock()
 			newInterval := cdcInterval
 			configMu.RUnlock()
@@ -361,7 +361,7 @@ func verificationLoop() {
 				}()
 			performAllVerifications()
 			}()
-			
+
 			configMu.RLock()
 			newInterval := verificationInterval
 			configMu.RUnlock()
@@ -700,7 +700,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	ctxOut, cancelOut := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancelOut()
 	cmdOut := exec.CommandContext(ctxOut, "sh", "-c", bcpOutCmd)
-	
+
 	log.Printf("[FULL_SYNC] Step 10: Executing BCP export command for mapping_id=%d (timeout: 2 hours)...", mapping.MappingID)
 	outputOut, err := cmdOut.CombinedOutput()
 	outputOutStr := string(outputOut)
@@ -717,7 +717,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		}
 		return
 	}
-	
+
 	// Parse export output for row count
 	exportRows := parseBCPRowCount(outputOutStr)
 	log.Printf("[FULL_SYNC] Step 10 SUCCESS: Export completed - %d rows exported for mapping_id=%d", exportRows, mapping.MappingID)
@@ -737,7 +737,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	ctxIn, cancelIn := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancelIn()
 	cmdIn := exec.CommandContext(ctxIn, "sh", "-c", bcpInCmd)
-	
+
 	log.Printf("[FULL_SYNC] Step 11: Executing BCP import command for mapping_id=%d (timeout: 2 hours, batch_size: %d)...", mapping.MappingID, batchSize)
 	outputIn, err := cmdIn.CombinedOutput()
 	outputInStr := string(outputIn)
@@ -755,13 +755,13 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		}
 		return
 	}
-	
+
 	// Parse import output for row count
 	importRows := parseBCPRowCount(outputInStr)
 	log.Printf("[FULL_SYNC] Step 11 SUCCESS: Import completed - %d rows imported for mapping_id=%d", importRows, mapping.MappingID)
 	log.Printf("[FULL_SYNC] Step 11: BCP import output: %s", outputInStr)
 	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP import completed: %d rows", importRows), "FULL_SYNC", importRows, 0)
-	
+
 	// Verify row count matches
 	if exportRows > 0 && importRows != exportRows {
 		log.Printf("[FULL_SYNC] Step 12 WARNING: Row count mismatch for mapping_id=%d! Exported: %d, Imported: %d", mapping.MappingID, exportRows, importRows)
@@ -791,7 +791,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	log.Printf("[FULL_SYNC] COMPLETED: Full sync finished for mapping_id=%d, duration: %v, exported: %d rows, imported: %d rows",
 		mapping.MappingID, duration, exportRows, importRows)
-	logSync(mapping.MappingID, "INFO", 
+	logSync(mapping.MappingID, "INFO",
 		fmt.Sprintf("Full sync completed via BCP-to-BCP, duration: %v", duration),
 		"FULL_SYNC", 0, int(duration.Milliseconds()))
 }
@@ -867,13 +867,13 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 				maxLSN = lsnStr
 			}
 		}
-		
+
 		// Extract PK value
 		if pkVal, ok := change[mapping.PrimaryKeyColumn]; ok {
 			pkValues = append(pkValues, pkVal)
 		}
 	}
-	
+
 	if len(pkValues) == 0 {
 		log.Printf("[CDC] mapping_id=%d: Step 3 WARNING - No primary key values found in CDC changes", mapping.MappingID)
 		updateSyncStatus(statusID, "COMPLETED", 0, 0, "No primary key values found")
@@ -899,11 +899,11 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get source columns: %v", err))
 		return
 	}
-	
+
 	// Get timestamp and identity columns to exclude
 	timestampCols, _ := getTimestampColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	identityCols, _ := getIdentityColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	excludeMap := make(map[string]bool)
 	for _, col := range timestampCols {
 		excludeMap[strings.ToLower(col)] = true
@@ -911,7 +911,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	for _, col := range identityCols {
 		excludeMap[strings.ToLower(col)] = true
 	}
-	
+
 	// Build column list (excluding timestamp and identity)
 	columns := make([]string, 0)
 	for _, col := range sourceCols {
@@ -925,7 +925,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	// Split PKs into batches of 1000 to avoid command line length limits
 	batchSizePK := 1000
 	totalBatches := (len(pkValues) + batchSizePK - 1) / batchSizePK
-	log.Printf("[CDC] mapping_id=%d: Step 6 - Processing %d primary keys in %d batches (batch size: %d)...", 
+	log.Printf("[CDC] mapping_id=%d: Step 6 - Processing %d primary keys in %d batches (batch size: %d)...",
 		mapping.MappingID, len(pkValues), totalBatches, batchSizePK)
 
 	// Step 7: Connect to destination early
@@ -937,7 +937,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 	defer destDB.Close()
-	
+
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
 		log.Printf("[CDC] mapping_id=%d: Step 7 FAILED - Failed to switch to destination database: %v", mapping.MappingID, err)
@@ -949,7 +949,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	// Prepare final combined file
 	finalTmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("cdc_sync_%d_%d_final.dat", mapping.FlowID, mapping.MappingID))
 	defer os.Remove(finalTmpFile)
-	
+
 	// Create or truncate final file
 	finalFile, err := os.Create(finalTmpFile)
 	if err != nil {
@@ -970,8 +970,8 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			endIdx = len(pkValues)
 		}
 		batchPKs := pkValues[startIdx:endIdx]
-		
-		log.Printf("[CDC] mapping_id=%d: Step 8 - Processing batch %d/%d (%d PKs)...", 
+
+		log.Printf("[CDC] mapping_id=%d: Step 8 - Processing batch %d/%d (%d PKs)...",
 			mapping.MappingID, batchNum+1, totalBatches, len(batchPKs))
 
 		// Step 8a: Build PK IN clause for this batch
@@ -980,7 +980,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		// Step 8b: BCP export from source for this batch
 		batchTmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("cdc_sync_%d_%d_batch_%d.dat", mapping.FlowID, mapping.MappingID, batchNum))
 		defer os.Remove(batchTmpFile)
-		
+
 		selectQuery := fmt.Sprintf(`
 			SELECT %s 
 			FROM [%s].[%s].[%s]
@@ -989,14 +989,14 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		`, strings.Join(columns, ", "),
 			mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
 			mapping.PrimaryKeyColumn, pkInClause, mapping.PrimaryKeyColumn)
-		
+
 		bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
 			strings.ReplaceAll(selectQuery, "\n", " "),
 			batchTmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
-		
+
 		ctxOut, cancelOut := context.WithTimeout(context.Background(), 2*time.Hour)
 		cmdOut := exec.CommandContext(ctxOut, "sh", "-c", bcpOutCmd)
-		
+
 		outputOut, err := cmdOut.CombinedOutput()
 		cancelOut()
 		outputOutStr := string(outputOut)
@@ -1007,14 +1007,14 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 				updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
 				return
 			}
-			log.Printf("[CDC] mapping_id=%d: Step 8b FAILED - BCP export failed for batch %d: %v, output: %s", 
+			log.Printf("[CDC] mapping_id=%d: Step 8b FAILED - BCP export failed for batch %d: %v, output: %s",
 				mapping.MappingID, batchNum+1, err, outputOutStr)
 			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed for batch %d: %v", batchNum+1, err))
 			return
 		}
 		batchExportRows := parseBCPRowCount(outputOutStr)
 		totalExportRows += batchExportRows
-		log.Printf("[CDC] mapping_id=%d: Step 8b SUCCESS - Exported %d rows from source (batch %d/%d)", 
+		log.Printf("[CDC] mapping_id=%d: Step 8b SUCCESS - Exported %d rows from source (batch %d/%d)",
 			mapping.MappingID, batchExportRows, batchNum+1, totalBatches)
 
 		// Step 8c: Append batch file to final file
@@ -1047,21 +1047,21 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			WHERE %s IN (%s)
 		`, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
 			mapping.PrimaryKeyColumn, pkInClause)
-		
+
 		result, err := destDB.Exec(deleteQuery)
 		if err != nil {
-			log.Printf("[CDC] mapping_id=%d: Step 8d FAILED - Failed to delete from destination (batch %d): %v", 
+			log.Printf("[CDC] mapping_id=%d: Step 8d FAILED - Failed to delete from destination (batch %d): %v",
 				mapping.MappingID, batchNum+1, err)
 			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to delete from destination (batch %d): %v", batchNum+1, err))
 			return
 		}
 		rowsAffected, _ := result.RowsAffected()
 		totalDeleteRows += rowsAffected
-		log.Printf("[CDC] mapping_id=%d: Step 8d SUCCESS - Deleted %d records from destination (batch %d/%d)", 
+		log.Printf("[CDC] mapping_id=%d: Step 8d SUCCESS - Deleted %d records from destination (batch %d/%d)",
 			mapping.MappingID, rowsAffected, batchNum+1, totalBatches)
 	}
 
-	log.Printf("[CDC] mapping_id=%d: Step 8 SUCCESS - Processed all batches: %d exported, %d deleted", 
+	log.Printf("[CDC] mapping_id=%d: Step 8 SUCCESS - Processed all batches: %d exported, %d deleted",
 		mapping.MappingID, totalExportRows, totalDeleteRows)
 
 	// Step 9: BCP import final combined file to destination
@@ -1069,15 +1069,15 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	configMu.RLock()
 	batchSizeVal := batchSize
 	configMu.RUnlock()
-	
+
 	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable,
 		finalTmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSizeVal)
-	
+
 	ctxIn, cancelIn := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancelIn()
 	cmdIn := exec.CommandContext(ctxIn, "sh", "-c", bcpInCmd)
-	
+
 	outputIn, err := cmdIn.CombinedOutput()
 	outputInStr := string(outputIn)
 	if err != nil {
@@ -1103,7 +1103,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 
 	recordsProcessed := int64(importRows)
 	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, 0, "")
-	
+
 	log.Printf("[CDC] mapping_id=%d: COMPLETED - CDC sync finished: %d rows processed", mapping.MappingID, recordsProcessed)
 		logSync(mapping.MappingID, "INFO", 
 		fmt.Sprintf("CDC sync completed: %d rows processed", recordsProcessed),
@@ -1163,7 +1163,7 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 	timestampColsDest, _ := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	identityColsSource, _ := getIdentityColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	identityColsDest, _ := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
-	
+
 	excludeMap := make(map[string]bool)
 	for _, col := range timestampColsSource {
 		excludeMap[strings.ToLower(col)] = true
@@ -1378,7 +1378,6 @@ func extractPassword(connStr string) string {
 	return ""
 }
 
-
 func applyInsert(db *sql.DB, mapping TableMapping, change map[string]interface{}) error {
 	columns := make([]string, 0)
 	values := make([]interface{}, 0)
@@ -1505,12 +1504,12 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
-		log.Printf("[getMinLSN] ERROR: Failed to get CDC table name for mapping_id=%d (table: %s.%s.%s): %v", 
+		log.Printf("[getMinLSN] ERROR: Failed to get CDC table name for mapping_id=%d (table: %s.%s.%s): %v",
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, err)
 		return ""
 	}
 	if !cdcTableName.Valid || cdcTableName.String == "" {
-		log.Printf("[getMinLSN] ERROR: CDC table name is NULL for mapping_id=%d (table: %s.%s.%s)", 
+		log.Printf("[getMinLSN] ERROR: CDC table name is NULL for mapping_id=%d (table: %s.%s.%s)",
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 		return ""
 	}
@@ -1522,10 +1521,10 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 	err = db.QueryRow(lsnQuery).Scan(&lsn)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			log.Printf("[getMinLSN] WARNING: No LSN found in CDC table [cdc.%s] for mapping_id=%d (table may be empty)", 
+			log.Printf("[getMinLSN] WARNING: No LSN found in CDC table [cdc.%s] for mapping_id=%d (table may be empty)",
 				cdcTableName.String, mapping.MappingID)
 		} else {
-			log.Printf("[getMinLSN] ERROR: Failed to get MIN LSN from CDC table [cdc.%s] for mapping_id=%d: %v", 
+			log.Printf("[getMinLSN] ERROR: Failed to get MIN LSN from CDC table [cdc.%s] for mapping_id=%d: %v",
 				cdcTableName.String, mapping.MappingID, err)
 		}
 		return ""
@@ -1542,16 +1541,16 @@ func getMaxLSN(mapping TableMapping, db *sql.DB) string {
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
-		log.Printf("[getMaxLSN] ERROR: Failed to get CDC table name for mapping_id=%d (table: %s.%s.%s): %v", 
+		log.Printf("[getMaxLSN] ERROR: Failed to get CDC table name for mapping_id=%d (table: %s.%s.%s): %v",
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, err)
 		return ""
 	}
 	if !cdcTableName.Valid || cdcTableName.String == "" {
-		log.Printf("[getMaxLSN] ERROR: CDC table name is NULL for mapping_id=%d (table: %s.%s.%s)", 
+		log.Printf("[getMaxLSN] ERROR: CDC table name is NULL for mapping_id=%d (table: %s.%s.%s)",
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 		return ""
 	}
@@ -1563,15 +1562,15 @@ func getMaxLSN(mapping TableMapping, db *sql.DB) string {
 	err = db.QueryRow(lsnQuery).Scan(&lsn)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			log.Printf("[getMaxLSN] WARNING: No LSN found in CDC table [cdc.%s] for mapping_id=%d (table may be empty)", 
+			log.Printf("[getMaxLSN] WARNING: No LSN found in CDC table [cdc.%s] for mapping_id=%d (table may be empty)",
 				cdcTableName.String, mapping.MappingID)
 		} else {
-			log.Printf("[getMaxLSN] ERROR: Failed to get MAX LSN from CDC table [cdc.%s] for mapping_id=%d: %v", 
+			log.Printf("[getMaxLSN] ERROR: Failed to get MAX LSN from CDC table [cdc.%s] for mapping_id=%d: %v",
 				cdcTableName.String, mapping.MappingID, err)
 		}
 		return ""
 	}
-	
+
 	return hex.EncodeToString(lsn)
 }
 
@@ -1723,7 +1722,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	if !pkIncluded {
 		verifyColsWithPK = append([]string{mapping.PrimaryKeyColumn}, verifyColsWithPK...)
 	}
-	
+
 	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Querying last 10,000 rows from destination...", mapping.MappingID)
 	destQuery := fmt.Sprintf(`
 		SELECT TOP 10000 %s
@@ -1867,9 +1866,23 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
+	// Calculate combined MD5 for all rows
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 7 - Calculating combined MD5 hashes...", mapping.MappingID)
+	destCombinedMD5 := calculateRowsMD5(destData)
+	
+	// Convert sourceData map to slice for MD5 calculation
+	sourceDataSlice := make([]map[string]interface{}, 0, len(sourceData))
+	for _, row := range sourceData {
+		sourceDataSlice = append(sourceDataSlice, row)
+	}
+	sourceCombinedMD5 := calculateRowsMD5(sourceDataSlice)
+	log.Printf("[VERIFICATION] mapping_id=%d: Destination Combined MD5: %s", mapping.MappingID, destCombinedMD5)
+	log.Printf("[VERIFICATION] mapping_id=%d: Source Combined MD5: %s", mapping.MappingID, sourceCombinedMD5)
+
 	mismatches := int64(0)
 	compared := int64(0)
 
+	// Compare individual rows for detailed mismatch count
 	for _, destRow := range destData {
 		pkVal := destRow[mapping.PrimaryKeyColumn]
 		sourceRow, exists := sourceData[pkVal]
@@ -1889,11 +1902,15 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	status := "PASSED"
-	if mismatches > 0 {
+	if destCombinedMD5 != sourceCombinedMD5 {
 		status = "FAILED"
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 7 FAILED - MD5 mismatch detected!", mapping.MappingID)
+		logError(&mapping.MappingID, nil, "VERIFICATION", "MD5 mismatch detected between source and destination for last 10k rows", nil)
+	} else {
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 7 SUCCESS - MD5 hashes match.", mapping.MappingID)
 	}
 
-	logVerification(mapping.MappingID, "MD5_COMPARISON", "", "", 
+	logVerification(mapping.MappingID, "MD5_COMPARISON", sourceCombinedMD5, destCombinedMD5,
 		int64(len(destData)), int64(len(sourceData)), compared, mismatches, status, "")
 
 	if mismatches > 0 {
@@ -1930,7 +1947,7 @@ func calculateRowsMD5(rows []map[string]interface{}) string {
 		sb.WriteString(rowMD5)
 		sb.WriteString("|")
 	}
-	
+
 	hash := md5.Sum([]byte(sb.String()))
 	return hex.EncodeToString(hash[:])
 }
@@ -1958,7 +1975,7 @@ func getEnabledMappings() ([]TableMapping, error) {
 	INNER JOIN flows f ON tm.flow_id = f.flow_id
 	WHERE tm.is_enabled = 1 
 	AND f.is_enabled = 1`
-	
+
 	rows, err := configDB.Query(query)
 	if err != nil {
 		return nil, err
@@ -1976,14 +1993,14 @@ func getEnabledMappings() ([]TableMapping, error) {
 			log.Printf("[getEnabledMappings] WARNING: Failed to scan row: %v", err)
 			continue
 		}
-		
+
 		// Convert binary LSN to hex string if not null
 		if lastCDCLSNBinary != nil && len(lastCDCLSNBinary) > 0 {
 			m.LastCDCLSN = sql.NullString{String: hex.EncodeToString(lastCDCLSNBinary), Valid: true}
 		} else {
 			m.LastCDCLSN = sql.NullString{Valid: false}
 		}
-		
+
 		mappings = append(mappings, m)
 	}
 
@@ -2061,7 +2078,7 @@ func updateLastLSN(mappingID int, lsn string) {
 		log.Printf("[updateLastLSN] ERROR: Failed to decode LSN hex string '%s' for mapping_id=%d: %v", lsn, mappingID, err)
 		return
 	}
-	
+
 	// Update with binary LSN and sync timestamp
 	_, err = configDB.Exec("UPDATE table_mappings SET last_cdc_lsn = @p1, last_cdc_sync_at = GETUTCDATE() WHERE mapping_id = @p2", lsnBytes, mappingID)
 	if err != nil {
