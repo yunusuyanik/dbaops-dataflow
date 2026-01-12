@@ -781,7 +781,7 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 			log.Printf("[FULL_SYNC] Step 14 SUCCESS: Saving maximum LSN after full sync: %s for mapping_id=%d", maxLSN, mapping.MappingID)
 			updateLastLSN(mapping.MappingID, maxLSN)
 		} else {
-			log.Printf("[FULL_SYNC] Step 14 WARNING: Could not get maximum LSN after full sync for mapping_id=%d", mapping.MappingID)
+			log.Printf("[FULL_SYNC] Step 14 WARNING: Could not get maximum LSN after full sync for mapping_id=%d (check getMaxLSN logs above for details)", mapping.MappingID)
 		}
 	}
 
@@ -1308,14 +1308,30 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		WHERE source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	
-	if err := db.QueryRow(query).Scan(&captureInstance); err != nil || !captureInstance.Valid {
+	err := db.QueryRow(query).Scan(&captureInstance)
+	if err != nil {
+		log.Printf("[getMinLSN] ERROR: Failed to get capture instance for mapping_id=%d (table: %s.%s.%s): %v", 
+			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, err)
+		return ""
+	}
+	if !captureInstance.Valid {
+		log.Printf("[getMinLSN] ERROR: Capture instance is NULL for mapping_id=%d (table: %s.%s.%s)", 
+			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 		return ""
 	}
 
 	lsnQuery := fmt.Sprintf(`SELECT MIN(__$start_lsn) FROM cdc.[%s]`, captureInstance.String)
 
 	var lsn []byte
-	if err := db.QueryRow(lsnQuery).Scan(&lsn); err != nil {
+	err = db.QueryRow(lsnQuery).Scan(&lsn)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("[getMinLSN] WARNING: No LSN found in CDC table [%s] for mapping_id=%d (table may be empty)", 
+				captureInstance.String, mapping.MappingID)
+		} else {
+			log.Printf("[getMinLSN] ERROR: Failed to get MIN LSN from CDC table [%s] for mapping_id=%d: %v", 
+				captureInstance.String, mapping.MappingID, err)
+		}
 		return ""
 	}
 	
@@ -1330,14 +1346,30 @@ func getMaxLSN(mapping TableMapping, db *sql.DB) string {
 		WHERE source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	
-	if err := db.QueryRow(query).Scan(&captureInstance); err != nil || !captureInstance.Valid {
+	err := db.QueryRow(query).Scan(&captureInstance)
+	if err != nil {
+		log.Printf("[getMaxLSN] ERROR: Failed to get capture instance for mapping_id=%d (table: %s.%s.%s): %v", 
+			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, err)
+		return ""
+	}
+	if !captureInstance.Valid {
+		log.Printf("[getMaxLSN] ERROR: Capture instance is NULL for mapping_id=%d (table: %s.%s.%s)", 
+			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 		return ""
 	}
 
 	lsnQuery := fmt.Sprintf(`SELECT MAX(__$start_lsn) FROM cdc.[%s]`, captureInstance.String)
 
 	var lsn []byte
-	if err := db.QueryRow(lsnQuery).Scan(&lsn); err != nil {
+	err = db.QueryRow(lsnQuery).Scan(&lsn)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("[getMaxLSN] WARNING: No LSN found in CDC table [%s] for mapping_id=%d (table may be empty)", 
+				captureInstance.String, mapping.MappingID)
+		} else {
+			log.Printf("[getMaxLSN] ERROR: Failed to get MAX LSN from CDC table [%s] for mapping_id=%d: %v", 
+				captureInstance.String, mapping.MappingID, err)
+		}
 		return ""
 	}
 	
