@@ -1301,38 +1301,39 @@ func isCDCEnabled(mapping TableMapping, db *sql.DB) bool {
 }
 
 func getMinLSN(mapping TableMapping, db *sql.DB) string {
-	var captureInstance sql.NullString
+	// Get CDC table name from cdc.change_tables by joining with sys.tables
 	query := fmt.Sprintf(`
-		SELECT capture_instance 
-		FROM cdc.change_tables 
-		WHERE source_object_id = OBJECT_ID('[%s].[%s].[%s]')
+		SELECT t.name AS cdc_table_name
+		FROM cdc.change_tables ct
+		INNER JOIN sys.tables t ON t.object_id = ct.object_id
+		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	
-	err := db.QueryRow(query).Scan(&captureInstance)
+	var cdcTableName sql.NullString
+	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
-		log.Printf("[getMinLSN] ERROR: Failed to get capture instance for mapping_id=%d (table: %s.%s.%s): %v", 
+		log.Printf("[getMinLSN] ERROR: Failed to get CDC table name for mapping_id=%d (table: %s.%s.%s): %v", 
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, err)
 		return ""
 	}
-	if !captureInstance.Valid {
-		log.Printf("[getMinLSN] ERROR: Capture instance is NULL for mapping_id=%d (table: %s.%s.%s)", 
+	if !cdcTableName.Valid || cdcTableName.String == "" {
+		log.Printf("[getMinLSN] ERROR: CDC table name is NULL for mapping_id=%d (table: %s.%s.%s)", 
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 		return ""
 	}
 
-	// CDC tables are typically named as <capture_instance>_CT
-	cdcTableName := captureInstance.String + "_CT"
-	lsnQuery := fmt.Sprintf(`SELECT MIN(__$start_lsn) FROM cdc.[%s]`, cdcTableName)
+	log.Printf("[getMinLSN] Found CDC table name: cdc.%s for mapping_id=%d", cdcTableName.String, mapping.MappingID)
+	lsnQuery := fmt.Sprintf(`SELECT MIN(__$start_lsn) FROM cdc.[%s]`, cdcTableName.String)
 
 	var lsn []byte
 	err = db.QueryRow(lsnQuery).Scan(&lsn)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			log.Printf("[getMinLSN] WARNING: No LSN found in CDC table [cdc.%s] for mapping_id=%d (table may be empty)", 
-				cdcTableName, mapping.MappingID)
+				cdcTableName.String, mapping.MappingID)
 		} else {
 			log.Printf("[getMinLSN] ERROR: Failed to get MIN LSN from CDC table [cdc.%s] for mapping_id=%d: %v", 
-				cdcTableName, mapping.MappingID, err)
+				cdcTableName.String, mapping.MappingID, err)
 		}
 		return ""
 	}
@@ -1341,38 +1342,39 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 }
 
 func getMaxLSN(mapping TableMapping, db *sql.DB) string {
-	var captureInstance sql.NullString
+	// Get CDC table name from cdc.change_tables by joining with sys.tables
 	query := fmt.Sprintf(`
-		SELECT capture_instance 
-		FROM cdc.change_tables 
-		WHERE source_object_id = OBJECT_ID('[%s].[%s].[%s]')
+		SELECT t.name AS cdc_table_name
+		FROM cdc.change_tables ct
+		INNER JOIN sys.tables t ON t.object_id = ct.object_id
+		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	
-	err := db.QueryRow(query).Scan(&captureInstance)
+	var cdcTableName sql.NullString
+	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
-		log.Printf("[getMaxLSN] ERROR: Failed to get capture instance for mapping_id=%d (table: %s.%s.%s): %v", 
+		log.Printf("[getMaxLSN] ERROR: Failed to get CDC table name for mapping_id=%d (table: %s.%s.%s): %v", 
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, err)
 		return ""
 	}
-	if !captureInstance.Valid {
-		log.Printf("[getMaxLSN] ERROR: Capture instance is NULL for mapping_id=%d (table: %s.%s.%s)", 
+	if !cdcTableName.Valid || cdcTableName.String == "" {
+		log.Printf("[getMaxLSN] ERROR: CDC table name is NULL for mapping_id=%d (table: %s.%s.%s)", 
 			mapping.MappingID, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 		return ""
 	}
 
-	// CDC tables are typically named as <capture_instance>_CT
-	cdcTableName := captureInstance.String + "_CT"
-	lsnQuery := fmt.Sprintf(`SELECT MAX(__$start_lsn) FROM cdc.[%s]`, cdcTableName)
+	log.Printf("[getMaxLSN] Found CDC table name: cdc.%s for mapping_id=%d", cdcTableName.String, mapping.MappingID)
+	lsnQuery := fmt.Sprintf(`SELECT MAX(__$start_lsn) FROM cdc.[%s]`, cdcTableName.String)
 
 	var lsn []byte
 	err = db.QueryRow(lsnQuery).Scan(&lsn)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			log.Printf("[getMaxLSN] WARNING: No LSN found in CDC table [cdc.%s] for mapping_id=%d (table may be empty)", 
-				cdcTableName, mapping.MappingID)
+				cdcTableName.String, mapping.MappingID)
 		} else {
 			log.Printf("[getMaxLSN] ERROR: Failed to get MAX LSN from CDC table [cdc.%s] for mapping_id=%d: %v", 
-				cdcTableName, mapping.MappingID, err)
+				cdcTableName.String, mapping.MappingID, err)
 		}
 		return ""
 	}
