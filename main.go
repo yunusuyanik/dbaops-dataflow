@@ -773,6 +773,18 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	log.Printf("[FULL_SYNC] Step 13: Updating last_full_sync_at timestamp for mapping_id=%d...", mapping.MappingID)
 	updateLastFullSync(mapping.MappingID)
 
+	// Update CDC LSN after full sync (get current max LSN to continue CDC from there)
+	if mapping.CDCEnabled {
+		log.Printf("[FULL_SYNC] Step 14: CDC enabled, getting maximum LSN after full sync for mapping_id=%d...", mapping.MappingID)
+		maxLSN := getMaxLSN(mapping, sourceDB)
+		if maxLSN != "" {
+			log.Printf("[FULL_SYNC] Step 14 SUCCESS: Saving maximum LSN after full sync: %s for mapping_id=%d", maxLSN, mapping.MappingID)
+			updateLastLSN(mapping.MappingID, maxLSN)
+		} else {
+			log.Printf("[FULL_SYNC] Step 14 WARNING: Could not get maximum LSN after full sync for mapping_id=%d", mapping.MappingID)
+		}
+	}
+
 	duration := time.Since(startTime)
 	updateSyncStatus(statusID, "COMPLETED", 0, 0, "")
 
@@ -1310,6 +1322,28 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 	return hex.EncodeToString(lsn)
 }
 
+func getMaxLSN(mapping TableMapping, db *sql.DB) string {
+	var captureInstance sql.NullString
+	query := fmt.Sprintf(`
+		SELECT capture_instance 
+		FROM cdc.change_tables 
+		WHERE source_object_id = OBJECT_ID('[%s].[%s].[%s]')
+	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
+	
+	if err := db.QueryRow(query).Scan(&captureInstance); err != nil || !captureInstance.Valid {
+		return ""
+	}
+
+	lsnQuery := fmt.Sprintf(`SELECT MAX(__$start_lsn) FROM cdc.[%s]`, captureInstance.String)
+
+	var lsn []byte
+	if err := db.QueryRow(lsnQuery).Scan(&lsn); err != nil {
+		return ""
+	}
+	
+	return hex.EncodeToString(lsn)
+}
+
 func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[string]interface{}, error) {
 	var captureInstance sql.NullString
 	query := fmt.Sprintf(`
@@ -1439,61 +1473,23 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Get last ID from destination
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Getting last primary key value from destination...", mapping.MappingID)
-	lastIDQuery := fmt.Sprintf(`
-		SELECT TOP 1 %s
-		FROM [%s].[%s].[%s]
-		ORDER BY %s DESC
-	`, mapping.PrimaryKeyColumn,
-		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
-
-	var lastID interface{}
-	err = destDB.QueryRow(lastIDQuery).Scan(&lastID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - No data in destination table, skipping verification", mapping.MappingID)
-			return
-		}
-		log.Printf("[VERIFICATION] mapping_id=%d: Step 3 FAILED - Failed to get last ID from destination: %v", mapping.MappingID, err)
-		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to get last ID from dest: %v", err), nil)
-		return
-	}
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 SUCCESS - Last primary key value: %v", mapping.MappingID, lastID)
-
-	// Format lastID for SQL query
-	var lastIDStr string
-	switch v := lastID.(type) {
-	case string:
-		escaped := strings.ReplaceAll(v, "'", "''")
-		lastIDStr = fmt.Sprintf("'%s'", escaped)
-	case int, int32, int64, float32, float64:
-		lastIDStr = fmt.Sprintf("%v", v)
-	default:
-		valStr := fmt.Sprintf("%v", v)
-		escaped := strings.ReplaceAll(valStr, "'", "''")
-		lastIDStr = fmt.Sprintf("'%s'", escaped)
-	}
-
-	// Query last 10k rows before last ID (including last ID)
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 - Querying last 10,000 rows (<= %v) from destination...", mapping.MappingID, lastID)
-	query := fmt.Sprintf(`
+	// Query last 10k rows from destination (excluding timestamp/identity columns)
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Querying last 10,000 rows from destination...", mapping.MappingID)
+	destQuery := fmt.Sprintf(`
 		SELECT TOP 10000 %s
 		FROM [%s].[%s].[%s]
-		WHERE %s <= %s
 		ORDER BY %s DESC
 	`, strings.Join(verifyCols, ", "),
-		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
-		mapping.PrimaryKeyColumn, lastIDStr, mapping.PrimaryKeyColumn)
+		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
 
-	destRows, err := destDB.Query(query)
+	destRows, err := destDB.Query(destQuery)
 	if err != nil {
-		log.Printf("[VERIFICATION] mapping_id=%d: Step 4 FAILED - Failed to query destination: %v", mapping.MappingID, err)
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 3 FAILED - Failed to query destination: %v", mapping.MappingID, err)
 		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query dest: %v", err), nil)
 		return
 	}
 	defer destRows.Close()
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 SUCCESS - Queried destination table", mapping.MappingID)
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 SUCCESS - Queried destination table", mapping.MappingID)
 
 	destColumns, _ := destRows.Columns()
 	destData := make([]map[string]interface{}, 0)
@@ -1571,19 +1567,14 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Query source with same last ID constraint
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 6 - Querying source table for rows <= %v (matching %d primary key values)...", mapping.MappingID, lastID, len(inValues))
-
+	// Query same last 10k rows from source
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 - Querying last 10,000 rows from source...", mapping.MappingID)
 	sourceQuery := fmt.Sprintf(`
-		SELECT %s
+		SELECT TOP 10000 %s
 		FROM [%s].[%s].[%s]
-		WHERE %s <= %s AND %s IN (%s)
-		ORDER BY %s
+		ORDER BY %s DESC
 	`, strings.Join(verifyCols, ", "),
-		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
-		mapping.PrimaryKeyColumn, lastIDStr,
-		mapping.PrimaryKeyColumn, strings.Join(inValues, ", "),
-		mapping.PrimaryKeyColumn)
+		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable, mapping.PrimaryKeyColumn)
 	sourceRows, err := sourceDB.Query(sourceQuery)
 	if err != nil {
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 FAILED - Failed to query source: %v", mapping.MappingID, err)
@@ -1676,6 +1667,19 @@ func calculateRowMD5(row map[string]interface{}) string {
 		sb.WriteString("|")
 	}
 
+	hash := md5.Sum([]byte(sb.String()))
+	return hex.EncodeToString(hash[:])
+}
+
+func calculateRowsMD5(rows []map[string]interface{}) string {
+	// Calculate MD5 for all rows combined (sorted by primary key for consistency)
+	var sb strings.Builder
+	for _, row := range rows {
+		rowMD5 := calculateRowMD5(row)
+		sb.WriteString(rowMD5)
+		sb.WriteString("|")
+	}
+	
 	hash := md5.Sum([]byte(sb.String()))
 	return hex.EncodeToString(hash[:])
 }
