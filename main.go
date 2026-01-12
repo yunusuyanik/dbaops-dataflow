@@ -468,15 +468,19 @@ func processMapping(mapping TableMapping) {
 }
 
 func performAllVerifications() {
+	log.Printf("[VERIFICATION] Starting to perform verifications for all enabled mappings...")
 	mappings, err := getEnabledMappings()
 	if err != nil {
-		log.Printf("Error getting mappings for verification: %v", err)
+		log.Printf("[VERIFICATION] ERROR: Failed to get enabled mappings: %v", err)
 		return
 	}
 
 	if len(mappings) == 0 {
+		log.Printf("[VERIFICATION] No enabled mappings found, skipping verification...")
 		return
 	}
+
+	log.Printf("[VERIFICATION] Found %d enabled mapping(s) to verify", len(mappings))
 
 	configMu.RLock()
 	workers := parallelWorkers
@@ -486,22 +490,30 @@ func performAllVerifications() {
 		workers = len(mappings)
 	}
 
+	log.Printf("[VERIFICATION] Using %d parallel worker(s) to perform verifications", workers)
+
 	jobs := make(chan TableMapping, len(mappings))
 	var wgWorkers sync.WaitGroup
 
 	for i := 0; i < workers; i++ {
 		wgWorkers.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wgWorkers.Done()
 			for mapping := range jobs {
+				log.Printf("[VERIFICATION] Worker %d: Starting verification for mapping_id=%d (source: %s.%s.%s -> dest: %s.%s.%s)",
+					workerID, mapping.MappingID,
+					mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 				sourceDB, err := connectToServer(mapping.SourceConnString)
 				if err != nil {
+					log.Printf("[VERIFICATION] Worker %d: ERROR - Failed to connect to source for mapping_id=%d: %v", workerID, mapping.MappingID, err)
 					continue
 				}
 				performVerification(mapping, sourceDB)
 				sourceDB.Close()
+				log.Printf("[VERIFICATION] Worker %d: Completed verification for mapping_id=%d", workerID, mapping.MappingID)
 			}
-		}()
+		}(i)
 	}
 
 	for _, mapping := range mappings {
@@ -510,6 +522,7 @@ func performAllVerifications() {
 	close(jobs)
 
 	wgWorkers.Wait()
+	log.Printf("[VERIFICATION] Completed all verifications")
 }
 
 func needsFullSync(mapping TableMapping) bool {
@@ -1350,22 +1363,30 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	// Panic recovery for verification
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in performVerification (mapping_id=%d) recovered: %v", mapping.MappingID, r)
+			log.Printf("[VERIFICATION] PANIC in performVerification (mapping_id=%d) recovered: %v", mapping.MappingID, r)
 			logError(&mapping.MappingID, nil, "VERIFICATION",
 				fmt.Sprintf("Panic recovered: %v", r), nil)
 		}
 	}()
 
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 1 - Connecting to destination server...", mapping.MappingID)
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 1 FAILED - Failed to connect to destination: %v", mapping.MappingID, err)
+		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to connect to destination: %v", err), nil)
 		return
 	}
 	defer destDB.Close()
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 1 SUCCESS - Connected to destination server", mapping.MappingID)
 
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 2 - Switching to destination database [%s]...", mapping.MappingID, mapping.DestDatabase)
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 2 FAILED - Failed to switch to destination database: %v", mapping.MappingID, err)
+		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to switch to destination database: %v", err), nil)
 		return
 	}
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 2 SUCCESS - Switched to destination database", mapping.MappingID)
 
 	// Get timestamp and identity columns to exclude from verification
 	timestampColsDest, _ := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
@@ -1446,9 +1467,11 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	if len(destData) == 0 {
+		log.Printf("[VERIFICATION] mapping_id=%d: No data found in destination table, skipping verification", mapping.MappingID)
 		return
 	}
 
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 - Found %d rows in destination, extracting primary key values...", mapping.MappingID, len(destData))
 	pkValues := make([]interface{}, 0)
 	for _, row := range destData {
 		if pkVal, ok := row[mapping.PrimaryKeyColumn]; ok {
@@ -1457,8 +1480,11 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	if len(pkValues) == 0 {
+		log.Printf("[VERIFICATION] mapping_id=%d: No primary key values found, skipping verification", mapping.MappingID)
 		return
 	}
+
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 4 SUCCESS - Extracted %d primary key values", mapping.MappingID, len(pkValues))
 
 	// Build IN clause values (limit to 1000 for safety)
 	// Go-MSSQL driver doesn't handle IN clause parameters well, so we use direct values
@@ -1500,12 +1526,15 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		mapping.PrimaryKeyColumn, strings.Join(inValues, ", "),
 		mapping.PrimaryKeyColumn)
 
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 - Querying source table for %d primary key values...", mapping.MappingID, len(inValues))
 	sourceRows, err := sourceDB.Query(sourceQuery)
 	if err != nil {
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 5 FAILED - Failed to query source: %v", mapping.MappingID, err)
 		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query source: %v", err), nil)
 		return
 	}
 	defer sourceRows.Close()
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 5 SUCCESS - Queried source table", mapping.MappingID)
 
 	sourceColumns, _ := sourceRows.Columns()
 	sourceData := make(map[interface{}]map[string]interface{})
