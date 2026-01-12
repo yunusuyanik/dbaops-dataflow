@@ -248,7 +248,7 @@ func main() {
 
 	close(stopChan)
 	wg.Wait()
-
+	
 	configDB.Close()
 	if logFile != nil {
 		logFile.Close()
@@ -359,7 +359,7 @@ func verificationLoop() {
 						log.Printf("[VERIFICATION_LOOP] PANIC in performAllVerifications recovered: %v", r)
 					}
 				}()
-				performAllVerifications()
+			performAllVerifications()
 			}()
 
 			configMu.RLock()
@@ -415,9 +415,9 @@ func processAllMappings() {
 				processMapping(mapping)
 			}
 		}(i)
-	}
+		}
 
-	for _, mapping := range mappings {
+		for _, mapping := range mappings {
 		jobs <- mapping
 	}
 	close(jobs)
@@ -1122,9 +1122,9 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, 0, "")
 
 	log.Printf("[CDC] mapping_id=%d: COMPLETED - CDC sync finished: %d rows processed", mapping.MappingID, recordsProcessed)
-	logSync(mapping.MappingID, "INFO",
+		logSync(mapping.MappingID, "INFO", 
 		fmt.Sprintf("CDC sync completed: %d rows processed", recordsProcessed),
-		"CDC", recordsProcessed, 0)
+			"CDC", recordsProcessed, 0)
 }
 
 func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
@@ -1198,7 +1198,7 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
 		if !excludeMap[strings.ToLower(col)] {
-			sourceColMap[strings.ToLower(col)] = true
+		sourceColMap[strings.ToLower(col)] = true
 		}
 	}
 
@@ -1517,7 +1517,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-
+	
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1546,7 +1546,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		}
 		return ""
 	}
-
+	
 	return hex.EncodeToString(lsn)
 }
 
@@ -1599,7 +1599,7 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-
+	
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1739,7 +1739,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	if !pkIncluded {
 		verifyColsWithPK = append([]string{mapping.PrimaryKeyColumn}, verifyColsWithPK...)
 	}
-	
+
 	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Querying last 10 rows from destination...", mapping.MappingID)
 	destQuery := fmt.Sprintf(`
 		SELECT TOP 10 %s
@@ -1747,7 +1747,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		ORDER BY %s DESC
 	`, strings.Join(verifyColsWithPK, ", "),
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
-	
+
 	log.Printf("[VERIFICATION] mapping_id=%d: Destination Query: %s", mapping.MappingID, destQuery)
 
 	destRows, err := destDB.Query(destQuery)
@@ -1843,7 +1843,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	`, strings.Join(verifyColsWithPK, ", "),
 		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
 		mapping.PrimaryKeyColumn, strings.Join(inValues, ", "), mapping.PrimaryKeyColumn)
-	
+
 	log.Printf("[VERIFICATION] mapping_id=%d: Source Query: %s", mapping.MappingID, sourceQuery)
 	sourceRows, err := sourceDB.Query(sourceQuery)
 	if err != nil {
@@ -1888,14 +1888,14 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 
 	// Calculate combined MD5 for all rows
 	log.Printf("[VERIFICATION] mapping_id=%d: Step 7 - Calculating combined MD5 hashes...", mapping.MappingID)
-	destCombinedMD5 := calculateRowsMD5(destData)
-
-	// Convert sourceData map to slice for MD5 calculation
+	destCombinedMD5 := calculateRowsMD5(destData, mapping.PrimaryKeyColumn)
+	
+	// Convert sourceData map to slice for MD5 calculation (sorted by PK)
 	sourceDataSlice := make([]map[string]interface{}, 0, len(sourceData))
 	for _, row := range sourceData {
 		sourceDataSlice = append(sourceDataSlice, row)
 	}
-	sourceCombinedMD5 := calculateRowsMD5(sourceDataSlice)
+	sourceCombinedMD5 := calculateRowsMD5(sourceDataSlice, mapping.PrimaryKeyColumn)
 	log.Printf("[VERIFICATION] mapping_id=%d: Destination Combined MD5: %s", mapping.MappingID, destCombinedMD5)
 	log.Printf("[VERIFICATION] mapping_id=%d: Source Combined MD5: %s", mapping.MappingID, sourceCombinedMD5)
 
@@ -1934,7 +1934,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		int64(len(destData)), int64(len(sourceData)), compared, mismatches, status, "")
 
 	if mismatches > 0 {
-		logError(&mapping.MappingID, nil, "VERIFICATION",
+		logError(&mapping.MappingID, nil, "VERIFICATION", 
 			fmt.Sprintf("MD5 verification failed: %d mismatches out of %d compared", mismatches, compared), nil)
 	}
 }
@@ -1949,9 +1949,30 @@ func calculateRowMD5(row map[string]interface{}) string {
 
 	var sb strings.Builder
 	for _, k := range keys {
+		val := row[k]
 		sb.WriteString(k)
 		sb.WriteString("=")
-		sb.WriteString(fmt.Sprintf("%v", row[k]))
+		
+		// Normalize values for consistent hashing
+		if val == nil {
+			sb.WriteString("NULL")
+		} else {
+			// Convert to string consistently
+			switch v := val.(type) {
+			case []byte:
+				// Binary data - use hex encoding
+				sb.WriteString(hex.EncodeToString(v))
+			case string:
+				// String - use as is
+				sb.WriteString(v)
+			case time.Time:
+				// Time - use RFC3339 format
+				sb.WriteString(v.Format(time.RFC3339Nano))
+			default:
+				// Other types - convert to string
+				sb.WriteString(fmt.Sprintf("%v", v))
+			}
+		}
 		sb.WriteString("|")
 	}
 
@@ -1959,10 +1980,31 @@ func calculateRowMD5(row map[string]interface{}) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func calculateRowsMD5(rows []map[string]interface{}) string {
+func calculateRowsMD5(rows []map[string]interface{}, pkColumn string) string {
 	// Calculate MD5 for all rows combined (sorted by primary key for consistency)
+	// First, sort rows by primary key
+	sortedRows := make([]map[string]interface{}, len(rows))
+	copy(sortedRows, rows)
+	
+	// Sort by primary key value
+	sort.Slice(sortedRows, func(i, j int) bool {
+		pkI, okI := sortedRows[i][pkColumn]
+		pkJ, okJ := sortedRows[j][pkColumn]
+		if !okI && !okJ {
+			return false
+		}
+		if !okI {
+			return true
+		}
+		if !okJ {
+			return false
+		}
+		// Compare as strings for consistency
+		return fmt.Sprintf("%v", pkI) < fmt.Sprintf("%v", pkJ)
+	})
+	
 	var sb strings.Builder
-	for _, row := range rows {
+	for _, row := range sortedRows {
 		rowMD5 := calculateRowMD5(row)
 		sb.WriteString(rowMD5)
 		sb.WriteString("|")
@@ -2051,7 +2093,7 @@ func startSyncStatus(mappingID int, syncType, status string) int64 {
 		OUTPUT INSERTED.status_id
 		VALUES (@p1, @p2, @p3, 0, 0, GETUTCDATE())
 	`, mappingID, syncType, status).Scan(&statusID)
-
+	
 	if err != nil {
 		log.Printf("Failed to create sync status: %v", err)
 		return 0
@@ -2276,7 +2318,7 @@ func logError(mappingID *int, flowID *int, errorType, message string, details in
 	`, mappingID, flowID, errorType, message, detailsStr)
 }
 
-func logVerification(mappingID int, vType, sourceMD5, destMD5 string,
+func logVerification(mappingID int, vType, sourceMD5, destMD5 string, 
 	sourceCount, destCount, compared, mismatches int64, status, details string) {
 	configDB.Exec(`
 		INSERT INTO verification_logs 
