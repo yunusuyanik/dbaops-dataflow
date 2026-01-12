@@ -219,26 +219,39 @@ func getConfigValue(key string) string {
 }
 
 func main() {
-	log.Println("DBAOps DataFlow starting...")
+	log.Println("========================================")
+	log.Println("DBAOps DataFlow Service Starting...")
+	log.Println("========================================")
 
+	log.Printf("Step 6: Starting configuration reloader goroutine...")
 	wg.Add(1)
 	go configReloader()
 
+	log.Printf("Step 7: Starting sync loop goroutine (CDC interval: %v)...", cdcInterval)
 	wg.Add(1)
 	go syncLoop()
 
+	log.Printf("Step 8: Starting verification loop goroutine (interval: %v)...", verificationInterval)
 	wg.Add(1)
 	go verificationLoop()
 
+	log.Println("Step 9: All goroutines started. Service is running...")
+	log.Println("========================================")
+
 	select {
 	case <-stopChan:
+		log.Println("========================================")
 		log.Println("Stopping DBAOps DataFlow...")
+		log.Println("========================================")
 	}
 
 	close(stopChan)
 	wg.Wait()
 	
 	configDB.Close()
+	if logFile != nil {
+		logFile.Close()
+	}
 	log.Println("Shutdown complete")
 }
 
@@ -259,11 +272,12 @@ func configReloader() {
 
 func syncLoop() {
 	defer wg.Done()
+	log.Printf("[SYNC_LOOP] Sync loop started (interval: %v)", cdcInterval)
 
 	// Panic recovery for the entire loop
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in syncLoop recovered: %v", r)
+			log.Printf("[SYNC_LOOP] PANIC in syncLoop recovered: %v", r)
 			// Restart the loop after a delay
 			time.Sleep(5 * time.Second)
 			wg.Add(1)
@@ -281,13 +295,15 @@ func syncLoop() {
 	for {
 		select {
 		case <-stopChan:
+			log.Printf("[SYNC_LOOP] Sync loop stopped")
 			return
 		case <-ticker.C:
+			log.Printf("[SYNC_LOOP] Tick received, processing mappings...")
 			// Panic recovery for each iteration
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						log.Printf("PANIC in processAllMappings recovered: %v", r)
+						log.Printf("[SYNC_LOOP] PANIC in processAllMappings recovered: %v", r)
 					}
 				}()
 				processAllMappings()
@@ -297,6 +313,7 @@ func syncLoop() {
 			newInterval := cdcInterval
 			configMu.RUnlock()
 			if newInterval != interval {
+				log.Printf("[SYNC_LOOP] Interval changed from %v to %v, updating ticker...", interval, newInterval)
 				ticker.Stop()
 				ticker = time.NewTicker(newInterval)
 				interval = newInterval
@@ -307,11 +324,12 @@ func syncLoop() {
 
 func verificationLoop() {
 	defer wg.Done()
+	log.Printf("[VERIFICATION_LOOP] Verification loop started (interval: %v)", verificationInterval)
 
 	// Panic recovery for the entire loop
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("PANIC in verificationLoop recovered: %v", r)
+			log.Printf("[VERIFICATION_LOOP] PANIC in verificationLoop recovered: %v", r)
 			// Restart the loop after a delay
 			time.Sleep(5 * time.Second)
 			wg.Add(1)
@@ -329,13 +347,15 @@ func verificationLoop() {
 	for {
 		select {
 		case <-stopChan:
+			log.Printf("[VERIFICATION_LOOP] Verification loop stopped")
 			return
 		case <-ticker.C:
+			log.Printf("[VERIFICATION_LOOP] Tick received, performing verifications...")
 			// Panic recovery for each iteration
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						log.Printf("PANIC in performAllVerifications recovered: %v", r)
+						log.Printf("[VERIFICATION_LOOP] PANIC in performAllVerifications recovered: %v", r)
 					}
 				}()
 			performAllVerifications()
@@ -345,6 +365,7 @@ func verificationLoop() {
 			newInterval := verificationInterval
 			configMu.RUnlock()
 			if newInterval != interval {
+				log.Printf("[VERIFICATION_LOOP] Interval changed from %v to %v, updating ticker...", interval, newInterval)
 				ticker.Stop()
 				ticker = time.NewTicker(newInterval)
 				interval = newInterval
@@ -354,15 +375,19 @@ func verificationLoop() {
 }
 
 func processAllMappings() {
+	log.Printf("[SYNC] Starting to process all enabled mappings...")
 	mappings, err := getEnabledMappings()
 	if err != nil {
-		log.Printf("Error getting mappings: %v", err)
+		log.Printf("[SYNC] ERROR: Failed to get enabled mappings: %v", err)
 		return
 	}
 
 	if len(mappings) == 0 {
+		log.Printf("[SYNC] No enabled mappings found, skipping...")
 		return
 	}
+
+	log.Printf("[SYNC] Found %d enabled mapping(s) to process", len(mappings))
 
 	configMu.RLock()
 	workers := parallelWorkers
@@ -372,17 +397,23 @@ func processAllMappings() {
 		workers = len(mappings)
 	}
 
+	log.Printf("[SYNC] Using %d parallel worker(s) to process mappings", workers)
+
 	jobs := make(chan TableMapping, len(mappings))
 	var wgWorkers sync.WaitGroup
 
 	for i := 0; i < workers; i++ {
 		wgWorkers.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wgWorkers.Done()
 			for mapping := range jobs {
+				log.Printf("[SYNC] Worker %d: Processing mapping_id=%d (source: %s.%s.%s -> dest: %s.%s.%s)",
+					workerID, mapping.MappingID,
+					mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 				processMapping(mapping)
 			}
-		}()
+		}(i)
 		}
 
 		for _, mapping := range mappings {
@@ -391,6 +422,7 @@ func processAllMappings() {
 	close(jobs)
 
 	wgWorkers.Wait()
+	log.Printf("[SYNC] Completed processing all mappings")
 }
 
 func processMapping(mapping TableMapping) {
