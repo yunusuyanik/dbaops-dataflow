@@ -89,6 +89,7 @@ BEGIN
         is_enabled BIT NOT NULL DEFAULT 1,
         cdc_enabled BIT NOT NULL DEFAULT 0,
         last_cdc_lsn BINARY(10) NULL,
+        last_cdc_sync_at DATETIME2 NULL,
         last_full_sync_at DATETIME2 NULL,
         created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
         updated_at DATETIME2 NOT NULL DEFAULT GETUTCDATE()

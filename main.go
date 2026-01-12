@@ -825,6 +825,9 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			updateSyncStatus(statusID, "COMPLETED", 0, 0, "No CDC data available")
 			return
 		}
+		// Save initial LSN so we don't keep starting from the same point
+		log.Printf("[CDC] mapping_id=%d: Step 1 - Saving initial LSN: %s", mapping.MappingID, lastLSN)
+		updateLastLSN(mapping.MappingID, lastLSN)
 	}
 	log.Printf("[CDC] mapping_id=%d: Step 1 SUCCESS - Last LSN: %s", mapping.MappingID, lastLSN)
 
@@ -1965,12 +1968,22 @@ func getEnabledMappings() ([]TableMapping, error) {
 	var mappings []TableMapping
 	for rows.Next() {
 		var m TableMapping
+		var lastCDCLSNBinary []byte // Read as binary
 		if err := rows.Scan(&m.MappingID, &m.FlowID, &m.SourceDatabase, &m.SourceSchema, &m.SourceTable,
 			&m.DestDatabase, &m.DestSchema, &m.DestTable, &m.PrimaryKeyColumn,
-			&m.IsFullSync, &m.IsEnabled, &m.CDCEnabled, &m.LastCDCLSN, &m.LastFullSyncAt, &m.LastCDCSyncAt,
+			&m.IsFullSync, &m.IsEnabled, &m.CDCEnabled, &lastCDCLSNBinary, &m.LastFullSyncAt, &m.LastCDCSyncAt,
 			&m.SourceConnString, &m.DestConnString); err != nil {
+			log.Printf("[getEnabledMappings] WARNING: Failed to scan row: %v", err)
 			continue
 		}
+		
+		// Convert binary LSN to hex string if not null
+		if lastCDCLSNBinary != nil && len(lastCDCLSNBinary) > 0 {
+			m.LastCDCLSN = sql.NullString{String: hex.EncodeToString(lastCDCLSNBinary), Valid: true}
+		} else {
+			m.LastCDCLSN = sql.NullString{Valid: false}
+		}
+		
 		mappings = append(mappings, m)
 	}
 
@@ -2042,7 +2055,20 @@ func updateLastProcessedPK(statusID int64, pkValue string) {
 }
 
 func updateLastLSN(mappingID int, lsn string) {
-	configDB.Exec("UPDATE table_mappings SET last_cdc_lsn = @p1, last_cdc_sync_at = GETUTCDATE() WHERE mapping_id = @p2", lsn, mappingID)
+	// Convert hex string to binary
+	lsnBytes, err := hex.DecodeString(lsn)
+	if err != nil {
+		log.Printf("[updateLastLSN] ERROR: Failed to decode LSN hex string '%s' for mapping_id=%d: %v", lsn, mappingID, err)
+		return
+	}
+	
+	// Update with binary LSN and sync timestamp
+	_, err = configDB.Exec("UPDATE table_mappings SET last_cdc_lsn = @p1, last_cdc_sync_at = GETUTCDATE() WHERE mapping_id = @p2", lsnBytes, mappingID)
+	if err != nil {
+		log.Printf("[updateLastLSN] ERROR: Failed to update last_cdc_lsn for mapping_id=%d: %v", mappingID, err)
+	} else {
+		log.Printf("[updateLastLSN] SUCCESS: Updated last_cdc_lsn and last_cdc_sync_at for mapping_id=%d (LSN: %s)", mappingID, lsn)
+	}
 }
 
 func createBCPFormatFile(flow Flow, mapping TableMapping, formatFile string, sourceColumns []string, timestampColumns []string) error {
