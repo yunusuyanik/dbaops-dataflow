@@ -918,54 +918,18 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	}
 	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (excluded %d timestamp/identity)", mapping.MappingID, len(columns), len(timestampCols)+len(identityCols))
 
-	// Step 6: Build PK IN clause for BCP query
-	log.Printf("[CDC] mapping_id=%d: Step 6 - Building PK IN clause for %d primary keys...", mapping.MappingID, len(pkValues))
-	pkInClause := buildPKInClause(pkValues, mapping.PrimaryKeyColumn)
-	log.Printf("[CDC] mapping_id=%d: Step 6 SUCCESS - Built PK IN clause", mapping.MappingID)
+	// Step 6: Process PKs in batches to avoid "argument list too long" error
+	// Split PKs into batches of 1000 to avoid command line length limits
+	batchSizePK := 1000
+	totalBatches := (len(pkValues) + batchSizePK - 1) / batchSizePK
+	log.Printf("[CDC] mapping_id=%d: Step 6 - Processing %d primary keys in %d batches (batch size: %d)...", 
+		mapping.MappingID, len(pkValues), totalBatches, batchSizePK)
 
-	// Step 7: BCP export from source (only records with matching PKs)
-	log.Printf("[CDC] mapping_id=%d: Step 7 - Starting BCP export from source (filtered by PKs)...", mapping.MappingID)
-	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("cdc_sync_%d_%d.dat", mapping.FlowID, mapping.MappingID))
-	defer os.Remove(tmpFile)
-	
-	selectQuery := fmt.Sprintf(`
-		SELECT %s 
-		FROM [%s].[%s].[%s]
-		WHERE %s IN (%s)
-		ORDER BY %s
-	`, strings.Join(columns, ", "),
-		mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
-		mapping.PrimaryKeyColumn, pkInClause, mapping.PrimaryKeyColumn)
-	
-	bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
-		strings.ReplaceAll(selectQuery, "\n", " "),
-		tmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
-	
-	ctxOut, cancelOut := context.WithTimeout(context.Background(), 2*time.Hour)
-	defer cancelOut()
-	cmdOut := exec.CommandContext(ctxOut, "sh", "-c", bcpOutCmd)
-	
-	outputOut, err := cmdOut.CombinedOutput()
-	outputOutStr := string(outputOut)
-		if err != nil {
-		if ctxOut.Err() == context.DeadlineExceeded {
-			errorMsg := "BCP export timeout after 2 hours"
-			log.Printf("[CDC] mapping_id=%d: Step 7 FAILED - %s", mapping.MappingID, errorMsg)
-			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
-			return
-		}
-		log.Printf("[CDC] mapping_id=%d: Step 7 FAILED - BCP export failed: %v, output: %s", mapping.MappingID, err, outputOutStr)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v", err))
-		return
-	}
-	exportRows := parseBCPRowCount(outputOutStr)
-	log.Printf("[CDC] mapping_id=%d: Step 7 SUCCESS - Exported %d rows from source", mapping.MappingID, exportRows)
-
-	// Step 8: Connect to destination
-	log.Printf("[CDC] mapping_id=%d: Step 8 - Connecting to destination server...", mapping.MappingID)
+	// Step 7: Connect to destination early
+	log.Printf("[CDC] mapping_id=%d: Step 7 - Connecting to destination server...", mapping.MappingID)
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 8 FAILED - Failed to connect to destination: %v", mapping.MappingID, err)
+		log.Printf("[CDC] mapping_id=%d: Step 7 FAILED - Failed to connect to destination: %v", mapping.MappingID, err)
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
 		return
 	}
@@ -973,37 +937,139 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 8 FAILED - Failed to switch to destination database: %v", mapping.MappingID, err)
+		log.Printf("[CDC] mapping_id=%d: Step 7 FAILED - Failed to switch to destination database: %v", mapping.MappingID, err)
 		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
 		return
 	}
-	log.Printf("[CDC] mapping_id=%d: Step 8 SUCCESS - Connected to destination", mapping.MappingID)
+	log.Printf("[CDC] mapping_id=%d: Step 7 SUCCESS - Connected to destination", mapping.MappingID)
 
-	// Step 9: Delete records from destination (by PK)
-	log.Printf("[CDC] mapping_id=%d: Step 9 - Deleting %d records from destination by PK...", mapping.MappingID, len(pkValues))
-	deleteQuery := fmt.Sprintf(`
-		DELETE FROM [%s].[%s].[%s]
-		WHERE %s IN (%s)
-	`, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
-		mapping.PrimaryKeyColumn, pkInClause)
+	// Prepare final combined file
+	finalTmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("cdc_sync_%d_%d_final.dat", mapping.FlowID, mapping.MappingID))
+	defer os.Remove(finalTmpFile)
 	
-	_, err = destDB.Exec(deleteQuery)
+	// Create or truncate final file
+	finalFile, err := os.Create(finalTmpFile)
 	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 9 FAILED - Failed to delete from destination: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to delete from destination: %v", err))
+		log.Printf("[CDC] mapping_id=%d: Step 8 FAILED - Failed to create final temp file: %v", mapping.MappingID, err)
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to create final temp file: %v", err))
 		return
 	}
-	log.Printf("[CDC] mapping_id=%d: Step 9 SUCCESS - Deleted records from destination", mapping.MappingID)
+	finalFile.Close()
 
-	// Step 10: BCP import to destination
-	log.Printf("[CDC] mapping_id=%d: Step 10 - Starting BCP import to destination...", mapping.MappingID)
+	totalExportRows := int64(0)
+	totalDeleteRows := int64(0)
+
+	// Process each batch
+	for batchNum := 0; batchNum < totalBatches; batchNum++ {
+		startIdx := batchNum * batchSizePK
+		endIdx := startIdx + batchSizePK
+		if endIdx > len(pkValues) {
+			endIdx = len(pkValues)
+		}
+		batchPKs := pkValues[startIdx:endIdx]
+		
+		log.Printf("[CDC] mapping_id=%d: Step 8 - Processing batch %d/%d (%d PKs)...", 
+			mapping.MappingID, batchNum+1, totalBatches, len(batchPKs))
+
+		// Step 8a: Build PK IN clause for this batch
+		pkInClause := buildPKInClause(batchPKs, mapping.PrimaryKeyColumn)
+
+		// Step 8b: BCP export from source for this batch
+		batchTmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("cdc_sync_%d_%d_batch_%d.dat", mapping.FlowID, mapping.MappingID, batchNum))
+		defer os.Remove(batchTmpFile)
+		
+		selectQuery := fmt.Sprintf(`
+			SELECT %s 
+			FROM [%s].[%s].[%s]
+			WHERE %s IN (%s)
+			ORDER BY %s
+		`, strings.Join(columns, ", "),
+			mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+			mapping.PrimaryKeyColumn, pkInClause, mapping.PrimaryKeyColumn)
+		
+		bcpOutCmd := fmt.Sprintf(`bcp "%s" queryout "%s" -n -S "%s,%d" -U "%s" -P "%s" -d "%s" -u`,
+			strings.ReplaceAll(selectQuery, "\n", " "),
+			batchTmpFile, flow.SourceServer, flow.SourcePort, flow.SourceUser, flow.SourcePass, mapping.SourceDatabase)
+		
+		ctxOut, cancelOut := context.WithTimeout(context.Background(), 2*time.Hour)
+		cmdOut := exec.CommandContext(ctxOut, "sh", "-c", bcpOutCmd)
+		
+		outputOut, err := cmdOut.CombinedOutput()
+		cancelOut()
+		outputOutStr := string(outputOut)
+		if err != nil {
+			if ctxOut.Err() == context.DeadlineExceeded {
+				errorMsg := fmt.Sprintf("BCP export timeout for batch %d", batchNum+1)
+				log.Printf("[CDC] mapping_id=%d: Step 8b FAILED - %s", mapping.MappingID, errorMsg)
+				updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+				return
+			}
+			log.Printf("[CDC] mapping_id=%d: Step 8b FAILED - BCP export failed for batch %d: %v, output: %s", 
+				mapping.MappingID, batchNum+1, err, outputOutStr)
+			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed for batch %d: %v", batchNum+1, err))
+			return
+		}
+		batchExportRows := parseBCPRowCount(outputOutStr)
+		totalExportRows += batchExportRows
+		log.Printf("[CDC] mapping_id=%d: Step 8b SUCCESS - Exported %d rows from source (batch %d/%d)", 
+			mapping.MappingID, batchExportRows, batchNum+1, totalBatches)
+
+		// Step 8c: Append batch file to final file
+		batchFile, err := os.Open(batchTmpFile)
+		if err != nil {
+			log.Printf("[CDC] mapping_id=%d: Step 8c FAILED - Failed to open batch file: %v", mapping.MappingID, err)
+			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to open batch file: %v", err))
+			return
+		}
+		finalFile, err := os.OpenFile(finalTmpFile, os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			batchFile.Close()
+			log.Printf("[CDC] mapping_id=%d: Step 8c FAILED - Failed to open final file: %v", mapping.MappingID, err)
+			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to open final file: %v", err))
+			return
+		}
+		_, err = io.Copy(finalFile, batchFile)
+		batchFile.Close()
+		finalFile.Close()
+		if err != nil {
+			log.Printf("[CDC] mapping_id=%d: Step 8c FAILED - Failed to append batch file: %v", mapping.MappingID, err)
+			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to append batch file: %v", err))
+			return
+		}
+		log.Printf("[CDC] mapping_id=%d: Step 8c SUCCESS - Appended batch %d/%d to final file", mapping.MappingID, batchNum+1, totalBatches)
+
+		// Step 8d: Delete records from destination for this batch
+		deleteQuery := fmt.Sprintf(`
+			DELETE FROM [%s].[%s].[%s]
+			WHERE %s IN (%s)
+		`, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable,
+			mapping.PrimaryKeyColumn, pkInClause)
+		
+		result, err := destDB.Exec(deleteQuery)
+		if err != nil {
+			log.Printf("[CDC] mapping_id=%d: Step 8d FAILED - Failed to delete from destination (batch %d): %v", 
+				mapping.MappingID, batchNum+1, err)
+			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to delete from destination (batch %d): %v", batchNum+1, err))
+			return
+		}
+		rowsAffected, _ := result.RowsAffected()
+		totalDeleteRows += rowsAffected
+		log.Printf("[CDC] mapping_id=%d: Step 8d SUCCESS - Deleted %d records from destination (batch %d/%d)", 
+			mapping.MappingID, rowsAffected, batchNum+1, totalBatches)
+	}
+
+	log.Printf("[CDC] mapping_id=%d: Step 8 SUCCESS - Processed all batches: %d exported, %d deleted", 
+		mapping.MappingID, totalExportRows, totalDeleteRows)
+
+	// Step 9: BCP import final combined file to destination
+	log.Printf("[CDC] mapping_id=%d: Step 9 - Starting BCP import to destination (combined file)...", mapping.MappingID)
 	configMu.RLock()
 	batchSizeVal := batchSize
 	configMu.RUnlock()
 	
 	bcpInCmd := fmt.Sprintf(`bcp "[%s].[%s]" in "%s" -n -E -S "%s,%d" -U "%s" -P "%s" -d "%s" -b %d -u`,
 		mapping.DestSchema, mapping.DestTable,
-		tmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSizeVal)
+		finalTmpFile, flow.DestServer, flow.DestPort, flow.DestUser, flow.DestPass, mapping.DestDatabase, batchSizeVal)
 	
 	ctxIn, cancelIn := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancelIn()
@@ -1014,22 +1080,22 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	if err != nil {
 		if ctxIn.Err() == context.DeadlineExceeded {
 			errorMsg := "BCP import timeout after 2 hours"
-			log.Printf("[CDC] mapping_id=%d: Step 10 FAILED - %s", mapping.MappingID, errorMsg)
+			log.Printf("[CDC] mapping_id=%d: Step 9 FAILED - %s", mapping.MappingID, errorMsg)
 			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
 			return
 		}
-		log.Printf("[CDC] mapping_id=%d: Step 10 FAILED - BCP import failed: %v, output: %s", mapping.MappingID, err, outputInStr)
+		log.Printf("[CDC] mapping_id=%d: Step 9 FAILED - BCP import failed: %v, output: %s", mapping.MappingID, err, outputInStr)
 		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP import failed: %v", err))
 		return
 	}
 	importRows := parseBCPRowCount(outputInStr)
-	log.Printf("[CDC] mapping_id=%d: Step 10 SUCCESS - Imported %d rows to destination", mapping.MappingID, importRows)
+	log.Printf("[CDC] mapping_id=%d: Step 9 SUCCESS - Imported %d rows to destination", mapping.MappingID, importRows)
 
-	// Step 11: Update last LSN and sync timestamp
+	// Step 10: Update last LSN and sync timestamp
 	if maxLSN != "" {
-		log.Printf("[CDC] mapping_id=%d: Step 11 - Updating last LSN to: %s", mapping.MappingID, maxLSN)
+		log.Printf("[CDC] mapping_id=%d: Step 10 - Updating last LSN to: %s", mapping.MappingID, maxLSN)
 		updateLastLSN(mapping.MappingID, maxLSN)
-		log.Printf("[CDC] mapping_id=%d: Step 11 SUCCESS - Updated last LSN", mapping.MappingID)
+		log.Printf("[CDC] mapping_id=%d: Step 10 SUCCESS - Updated last LSN", mapping.MappingID)
 	}
 
 	recordsProcessed := int64(importRows)
