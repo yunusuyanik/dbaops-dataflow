@@ -958,26 +958,24 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get source columns: %v", err))
 		return
 	}
-	
+
 	// Build column list exactly like full sync: source columns in source order
-	// First ensure PrimaryKeyColumn is first
+	// First ensure PrimaryKeyColumn is first (always include PK, even if it's identity)
 	columns := make([]string, 0)
 	pkFound := false
 	for _, col := range sourceCols {
 		if strings.EqualFold(col, mapping.PrimaryKeyColumn) {
-			if !excludeMap[strings.ToLower(col)] {
-				columns = append(columns, col)
-				pkFound = true
-			}
+			columns = append(columns, col)
+			pkFound = true
 			break
 		}
 	}
 	if !pkFound {
-		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Primary key column %s not found in source", mapping.MappingID, mapping.PrimaryKeyColumn)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Primary key column %s not found in source", mapping.PrimaryKeyColumn))
+		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Primary key column %s not found in source table", mapping.MappingID, mapping.PrimaryKeyColumn)
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Primary key column %s not found in source table", mapping.PrimaryKeyColumn))
 		return
 	}
-	
+
 	// Add other source columns (excluding timestamp, identity, and already added PK)
 	// This matches full sync exactly - use source column order
 	for _, col := range sourceCols {
@@ -986,7 +984,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (excluded %d timestamp/identity), using destination column order",
+	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (excluded %d timestamp/identity, PK always included)",
 		mapping.MappingID, len(columns), len(timestampColsSource)+len(timestampColsDest)+len(identityColsSource)+len(identityColsDest))
 
 	// Step 6: Process PKs in batches to avoid "argument list too long" error
