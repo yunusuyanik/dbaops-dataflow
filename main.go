@@ -1002,6 +1002,47 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
+	// Log column lists for debugging
+	if logFile != nil {
+		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Source columns (%d): %s\n",
+			mapping.MappingID, len(sourceCols), strings.Join(sourceCols, ", "))
+		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Destination columns (%d): %s\n",
+			mapping.MappingID, len(destCols), strings.Join(destCols, ", "))
+		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Final export columns (%d): %s\n",
+			mapping.MappingID, len(columns), strings.Join(columns, ", "))
+		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Excluded columns: %v\n",
+			mapping.MappingID, excludeMap)
+	}
+
+	// Log column lists for debugging (only to file)
+	if logFile != nil {
+		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Source columns (%d): %s\n",
+			mapping.MappingID, len(sourceCols), strings.Join(sourceCols, ", "))
+		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Destination columns (%d): %s\n",
+			mapping.MappingID, len(destCols), strings.Join(destCols, ", "))
+		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Final export columns (%d): %s\n",
+			mapping.MappingID, len(columns), strings.Join(columns, ", "))
+		
+		// Check for missing columns
+		missingCols := make([]string, 0)
+		for _, destCol := range destCols {
+			destColLower := strings.ToLower(destCol)
+			if excludeMap[destColLower] {
+				continue
+			}
+			if strings.EqualFold(destCol, mapping.PrimaryKeyColumn) {
+				continue
+			}
+			if _, exists := sourceColMap[destColLower]; !exists {
+				missingCols = append(missingCols, destCol)
+			}
+		}
+		if len(missingCols) > 0 {
+			fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 WARNING - Missing columns in source: %s\n",
+				mapping.MappingID, strings.Join(missingCols, ", "))
+		}
+	}
+
 	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (excluded %d timestamp/identity, PK always included)",
 		mapping.MappingID, len(columns), len(timestampColsSource)+len(timestampColsDest)+len(identityColsSource)+len(identityColsDest))
 
