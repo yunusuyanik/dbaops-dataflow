@@ -1111,10 +1111,12 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		cancelIn()
 		outputInStr := string(outputIn)
 		
-		// Always log full BCP import output for debugging
-		log.Printf("[CDC] mapping_id=%d: Step 8d - BCP import output (batch %d/%d):\n%s",
-			mapping.MappingID, batchNum+1, totalBatches, outputInStr)
-		
+		// Always log full BCP import output for debugging (only to file, not stdout)
+		if logFile != nil {
+			fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 8d - BCP import output (batch %d/%d):\n%s\n",
+				mapping.MappingID, batchNum+1, totalBatches, outputInStr)
+		}
+
 		if err != nil {
 			if ctxIn.Err() == context.DeadlineExceeded {
 				errorMsg := fmt.Sprintf("BCP import timeout for batch %d", batchNum+1)
