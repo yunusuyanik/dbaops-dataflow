@@ -28,6 +28,7 @@ var (
 	verificationInterval = 5 * time.Minute
 	parallelWorkers      = 5
 	batchSize            = 1000
+	verificationRowCount  = 10
 	maxRetryAttempts     = 3
 	retryDelay           = 30 * time.Second
 
@@ -204,6 +205,13 @@ func loadConfiguration() {
 	if val := getConfigValue("retry_delay_seconds"); val != "" {
 		if seconds, err := strconv.Atoi(val); err == nil && seconds > 0 {
 			retryDelay = time.Duration(seconds) * time.Second
+		}
+	}
+
+	// Load verification row count
+	if val := getConfigValue("verification_row_count"); val != "" {
+		if count, err := strconv.Atoi(val); err == nil && count > 0 {
+			verificationRowCount = count
 		}
 	}
 }
@@ -956,7 +964,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	// IMPORTANT: Include ALL columns (timestamp, identity, etc.) - no exclusions for BCP
 	columns := make([]string, 0)
 	pkFound := false
-	
+
 	// First ensure PrimaryKeyColumn is first
 	if sourceCol, exists := sourceColMap[strings.ToLower(mapping.PrimaryKeyColumn)]; exists {
 		columns = append(columns, sourceCol)
@@ -979,40 +987,6 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	// Log column lists for debugging
-	if logFile != nil {
-		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Source columns (%d): %s\n",
-			mapping.MappingID, len(sourceCols), strings.Join(sourceCols, ", "))
-		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Destination columns (%d): %s\n",
-			mapping.MappingID, len(destCols), strings.Join(destCols, ", "))
-		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Final export columns (%d): %s\n",
-			mapping.MappingID, len(columns), strings.Join(columns, ", "))
-	}
-
-	// Log column lists for debugging (only to file)
-	if logFile != nil {
-		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Source columns (%d): %s\n",
-			mapping.MappingID, len(sourceCols), strings.Join(sourceCols, ", "))
-		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Destination columns (%d): %s\n",
-			mapping.MappingID, len(destCols), strings.Join(destCols, ", "))
-		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Final export columns (%d): %s\n",
-			mapping.MappingID, len(columns), strings.Join(columns, ", "))
-
-		// Check for missing columns
-		missingCols := make([]string, 0)
-		for _, destCol := range destCols {
-			if strings.EqualFold(destCol, mapping.PrimaryKeyColumn) {
-				continue
-			}
-			if _, exists := sourceColMap[strings.ToLower(destCol)]; !exists {
-				missingCols = append(missingCols, destCol)
-			}
-		}
-		if len(missingCols) > 0 {
-			fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 WARNING - Missing columns in source: %s\n",
-				mapping.MappingID, strings.Join(missingCols, ", "))
-		}
-	}
 
 	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (all columns included, no exclusions)",
 		mapping.MappingID, len(columns))
@@ -1813,15 +1787,18 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		verifyColsWithPK = append([]string{mapping.PrimaryKeyColumn}, verifyColsWithPK...)
 	}
 
-	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Querying last 10 rows from destination...", mapping.MappingID)
+	configMu.RLock()
+	rowCount := verificationRowCount
+	configMu.RUnlock()
+
+	log.Printf("[VERIFICATION] mapping_id=%d: Step 3 - Querying last %d rows from destination...", mapping.MappingID, rowCount)
 	destQuery := fmt.Sprintf(`
-		SELECT TOP 10 %s
+		SELECT TOP %d %s
 		FROM [%s].[%s].[%s]
 		ORDER BY %s DESC
-	`, strings.Join(verifyColsWithPK, ", "),
+	`, rowCount, strings.Join(verifyColsWithPK, ", "),
 		mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn)
 
-	log.Printf("[VERIFICATION] mapping_id=%d: Destination Query: %s", mapping.MappingID, destQuery)
 
 	destRows, err := destDB.Query(destQuery)
 	if err != nil {
@@ -1998,7 +1975,10 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	if destCombinedMD5 != sourceCombinedMD5 {
 		status = "FAILED"
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 7 FAILED - MD5 mismatch detected!", mapping.MappingID)
-		logError(&mapping.MappingID, nil, "VERIFICATION", "MD5 mismatch detected between source and destination for last 10k rows", nil)
+		configMu.RLock()
+		rowCount := verificationRowCount
+		configMu.RUnlock()
+		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("MD5 mismatch detected between source and destination for last %d rows", rowCount), nil)
 	} else {
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 7 SUCCESS - MD5 hashes match.", mapping.MappingID)
 	}
