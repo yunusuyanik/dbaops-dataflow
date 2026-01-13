@@ -949,6 +949,14 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		excludeMap[strings.ToLower(col)] = true
 	}
 
+	// Get destination columns first (for BCP native mode, column order must match destination)
+	destCols, err := getTableColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
+	if err != nil {
+		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Failed to get destination columns: %v", mapping.MappingID, err)
+		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get destination columns: %v", err))
+		return
+	}
+
 	// Get source columns
 	sourceCols, err := getTableColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	if err != nil {
@@ -957,16 +965,21 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Build column list exactly like full sync: source columns in source order
-	// First ensure PrimaryKeyColumn is first (always include PK, even if it's identity)
+	// Build a map of source columns for quick lookup
+	sourceColMap := make(map[string]string)
+	for _, col := range sourceCols {
+		sourceColMap[strings.ToLower(col)] = col
+	}
+
+	// Build column list in DESTINATION order (required for BCP native mode)
+	// BCP import expects columns in destination table order
 	columns := make([]string, 0)
 	pkFound := false
-	for _, col := range sourceCols {
-		if strings.EqualFold(col, mapping.PrimaryKeyColumn) {
-			columns = append(columns, col)
-			pkFound = true
-			break
-		}
+	
+	// First ensure PrimaryKeyColumn is first (always include PK, even if it's identity)
+	if sourceCol, exists := sourceColMap[strings.ToLower(mapping.PrimaryKeyColumn)]; exists {
+		columns = append(columns, sourceCol)
+		pkFound = true
 	}
 	if !pkFound {
 		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Primary key column %s not found in source table", mapping.MappingID, mapping.PrimaryKeyColumn)
@@ -974,11 +987,18 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Add other source columns (excluding timestamp, identity, and already added PK)
-	// This matches full sync exactly - use source column order
-	for _, col := range sourceCols {
-		if !excludeMap[strings.ToLower(col)] && !strings.EqualFold(col, mapping.PrimaryKeyColumn) {
-			columns = append(columns, col)
+	// Add other columns in DESTINATION order (excluding timestamp, identity, and already added PK)
+	for _, destCol := range destCols {
+		destColLower := strings.ToLower(destCol)
+		if excludeMap[destColLower] {
+			continue
+		}
+		if strings.EqualFold(destCol, mapping.PrimaryKeyColumn) {
+			continue // Already added
+		}
+		// Find matching source column
+		if sourceCol, exists := sourceColMap[destColLower]; exists {
+			columns = append(columns, sourceCol)
 		}
 	}
 
