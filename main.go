@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -115,9 +114,8 @@ func initLogging() error {
 		return nil
 	}
 
-	// Write to both stdout and file
-	multiWriter := io.MultiWriter(os.Stdout, file)
-	log.SetOutput(multiWriter)
+	// Write only to file (not stdout)
+	log.SetOutput(file)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	logFile = file
@@ -248,7 +246,7 @@ func main() {
 
 	close(stopChan)
 	wg.Wait()
-	
+
 	configDB.Close()
 	if logFile != nil {
 		logFile.Close()
@@ -359,7 +357,7 @@ func verificationLoop() {
 						log.Printf("[VERIFICATION_LOOP] PANIC in performAllVerifications recovered: %v", r)
 					}
 				}()
-			performAllVerifications()
+				performAllVerifications()
 			}()
 
 			configMu.RLock()
@@ -415,9 +413,9 @@ func processAllMappings() {
 				processMapping(mapping)
 			}
 		}(i)
-		}
+	}
 
-		for _, mapping := range mappings {
+	for _, mapping := range mappings {
 		jobs <- mapping
 	}
 	close(jobs)
@@ -1110,7 +1108,7 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		outputIn, err := cmdIn.CombinedOutput()
 		cancelIn()
 		outputInStr := string(outputIn)
-		
+
 		// Always log full BCP import output for debugging (only to file, not stdout)
 		if logFile != nil {
 			fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 8d - BCP import output (batch %d/%d):\n%s\n",
@@ -1165,9 +1163,9 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 
 	log.Printf("[CDC] mapping_id=%d: COMPLETED - CDC sync finished: exported=%d, deleted=%d, imported=%d rows",
 		mapping.MappingID, recordsExported, recordsDeleted, recordsProcessed)
-		logSync(mapping.MappingID, "INFO", 
+	logSync(mapping.MappingID, "INFO",
 		fmt.Sprintf("CDC sync completed: exported=%d, deleted=%d, imported=%d rows", recordsExported, recordsDeleted, recordsProcessed),
-			"CDC", recordsProcessed, 0)
+		"CDC", recordsProcessed, 0)
 }
 
 func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
@@ -1241,7 +1239,7 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
 		if !excludeMap[strings.ToLower(col)] {
-		sourceColMap[strings.ToLower(col)] = true
+			sourceColMap[strings.ToLower(col)] = true
 		}
 	}
 
@@ -1560,7 +1558,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1589,7 +1587,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		}
 		return ""
 	}
-	
+
 	return hex.EncodeToString(lsn)
 }
 
@@ -1642,7 +1640,7 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1977,7 +1975,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		int64(len(destData)), int64(len(sourceData)), compared, mismatches, status, "")
 
 	if mismatches > 0 {
-		logError(&mapping.MappingID, nil, "VERIFICATION", 
+		logError(&mapping.MappingID, nil, "VERIFICATION",
 			fmt.Sprintf("MD5 verification failed: %d mismatches out of %d compared", mismatches, compared), nil)
 	}
 }
@@ -2136,7 +2134,7 @@ func startSyncStatus(mappingID int, syncType, status string) int64 {
 		OUTPUT INSERTED.status_id
 		VALUES (@p1, @p2, @p3, 0, 0, GETUTCDATE())
 	`, mappingID, syncType, status).Scan(&statusID)
-	
+
 	if err != nil {
 		log.Printf("Failed to create sync status: %v", err)
 		return 0
@@ -2369,7 +2367,7 @@ func logError(mappingID *int, flowID *int, errorType, message string, details in
 	`, mappingID, flowID, errorType, message, detailsStr)
 }
 
-func logVerification(mappingID int, vType, sourceMD5, destMD5 string, 
+func logVerification(mappingID int, vType, sourceMD5, destMD5 string,
 	sourceCount, destCount, compared, mismatches int64, status, details string) {
 	configDB.Exec(`
 		INSERT INTO verification_logs 
