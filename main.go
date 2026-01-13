@@ -929,26 +929,6 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Get timestamp and identity columns to exclude (from both source and dest)
-	timestampColsSource, _ := getTimestampColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	timestampColsDest, _ := getTimestampColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
-	identityColsSource, _ := getIdentityColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	identityColsDest, _ := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
-
-	excludeMap := make(map[string]bool)
-	for _, col := range timestampColsSource {
-		excludeMap[strings.ToLower(col)] = true
-	}
-	for _, col := range timestampColsDest {
-		excludeMap[strings.ToLower(col)] = true
-	}
-	for _, col := range identityColsSource {
-		excludeMap[strings.ToLower(col)] = true
-	}
-	for _, col := range identityColsDest {
-		excludeMap[strings.ToLower(col)] = true
-	}
-
 	// Get destination columns first (for BCP native mode, column order must match destination)
 	destCols, err := getTableColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	if err != nil {
@@ -973,10 +953,11 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 
 	// Build column list in DESTINATION order (required for BCP native mode)
 	// BCP import expects columns in destination table order
+	// IMPORTANT: Include ALL columns (timestamp, identity, etc.) - no exclusions for BCP
 	columns := make([]string, 0)
 	pkFound := false
 	
-	// First ensure PrimaryKeyColumn is first (always include PK, even if it's identity)
+	// First ensure PrimaryKeyColumn is first
 	if sourceCol, exists := sourceColMap[strings.ToLower(mapping.PrimaryKeyColumn)]; exists {
 		columns = append(columns, sourceCol)
 		pkFound = true
@@ -987,17 +968,13 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		return
 	}
 
-	// Add other columns in DESTINATION order (excluding timestamp, identity, and already added PK)
+	// Add ALL other columns in DESTINATION order (no exclusions - include timestamp, identity, everything)
 	for _, destCol := range destCols {
-		destColLower := strings.ToLower(destCol)
-		if excludeMap[destColLower] {
-			continue
-		}
 		if strings.EqualFold(destCol, mapping.PrimaryKeyColumn) {
 			continue // Already added
 		}
 		// Find matching source column
-		if sourceCol, exists := sourceColMap[destColLower]; exists {
+		if sourceCol, exists := sourceColMap[strings.ToLower(destCol)]; exists {
 			columns = append(columns, sourceCol)
 		}
 	}
@@ -1010,8 +987,6 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			mapping.MappingID, len(destCols), strings.Join(destCols, ", "))
 		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Final export columns (%d): %s\n",
 			mapping.MappingID, len(columns), strings.Join(columns, ", "))
-		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Excluded columns: %v\n",
-			mapping.MappingID, excludeMap)
 	}
 
 	// Log column lists for debugging (only to file)
@@ -1022,18 +997,14 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			mapping.MappingID, len(destCols), strings.Join(destCols, ", "))
 		fmt.Fprintf(logFile, "[CDC] mapping_id=%d: Step 5 DEBUG - Final export columns (%d): %s\n",
 			mapping.MappingID, len(columns), strings.Join(columns, ", "))
-		
+
 		// Check for missing columns
 		missingCols := make([]string, 0)
 		for _, destCol := range destCols {
-			destColLower := strings.ToLower(destCol)
-			if excludeMap[destColLower] {
-				continue
-			}
 			if strings.EqualFold(destCol, mapping.PrimaryKeyColumn) {
 				continue
 			}
-			if _, exists := sourceColMap[destColLower]; !exists {
+			if _, exists := sourceColMap[strings.ToLower(destCol)]; !exists {
 				missingCols = append(missingCols, destCol)
 			}
 		}
@@ -1043,8 +1014,8 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (excluded %d timestamp/identity, PK always included)",
-		mapping.MappingID, len(columns), len(timestampColsSource)+len(timestampColsDest)+len(identityColsSource)+len(identityColsDest))
+	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (all columns included, no exclusions)",
+		mapping.MappingID, len(columns))
 
 	// Step 6: Process PKs in batches to avoid "argument list too long" error
 	// Split PKs into batches of 1000 to avoid command line length limits
