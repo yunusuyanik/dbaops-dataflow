@@ -2103,14 +2103,8 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	configMu.RLock()
-	rowCount := verificationRowCount
-	configMu.RUnlock()
-
-	status := "SUCCESS"
 	statusMsg := "MD5 hashes match"
 	if destCombinedMD5 != sourceCombinedMD5 {
-		status = "FAILED"
 		statusMsg = fmt.Sprintf("MD5 mismatch detected, %d mismatches out of %d compared", mismatches, compared)
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 FAILED - MD5 mismatch detected!", mapping.MappingID)
 		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
@@ -2276,7 +2270,7 @@ func updateLastConnected(flowID int) {
 }
 
 // writeLog writes a unified log entry to the logs table
-func writeLog(flowID *int, mappingID *int, logType, logMessage, status string, recordsCount *int64, durationMs *int) {
+func writeLog(flowID *int, mappingID *int, logType, logMessage, status string, recordsCount *int64, durationMs *int64) {
 	var flowIDVal interface{}
 	var mappingIDVal interface{}
 	var recordsCountVal interface{}
