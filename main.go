@@ -471,14 +471,21 @@ func processMapping(mapping TableMapping) {
 
 	updateLastConnected(mapping.FlowID)
 
+	// Check if full sync is needed
 	if needsFullSync(mapping) {
 		log.Printf("[SYNC] mapping_id=%d: Full sync requested (is_full_sync=1), performing full table copy...", mapping.MappingID)
 		performFullSync(mapping, sourceDB)
-	} else if mapping.CDCEnabled {
+		// After full sync, refresh mapping to get updated is_full_sync value
+		// and continue with CDC if enabled
+		if mapping.CDCEnabled && mapping.IsEnabled {
+			log.Printf("[SYNC] mapping_id=%d: Full sync completed, continuing with CDC sync...", mapping.MappingID)
+			processCDC(mapping, sourceDB)
+		}
+	} else if mapping.CDCEnabled && mapping.IsEnabled {
 		log.Printf("[SYNC] mapping_id=%d: CDC enabled, checking for CDC changes (last_lsn: %s)...", mapping.MappingID, mapping.LastCDCLSN.String)
 		processCDC(mapping, sourceDB)
 	} else {
-		log.Printf("[SYNC] mapping_id=%d: No action needed (is_full_sync=0, cdc_enabled=0)", mapping.MappingID)
+		log.Printf("[SYNC] mapping_id=%d: No action needed (is_full_sync=0, cdc_enabled=0 or is_enabled=0)", mapping.MappingID)
 	}
 }
 
