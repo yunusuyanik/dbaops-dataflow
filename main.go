@@ -2114,6 +2114,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 
 	mismatches := int64(0)
 	compared := int64(0)
+	mismatchedPKs := make([]string, 0)
 
 	// Compare individual rows for detailed mismatch count
 	for _, destRow := range destData {
@@ -2122,6 +2123,7 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 
 		if !exists {
 			mismatches++
+			mismatchedPKs = append(mismatchedPKs, fmt.Sprintf("%v", pkVal))
 			continue
 		}
 
@@ -2131,12 +2133,22 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		compared++
 		if destMD5 != sourceMD5 {
 			mismatches++
+			mismatchedPKs = append(mismatchedPKs, fmt.Sprintf("%v", pkVal))
 		}
 	}
 
 	statusMsg := "MD5 hashes match"
 	if destCombinedMD5 != sourceCombinedMD5 {
-		statusMsg = fmt.Sprintf("MD5 mismatch detected, %d mismatches out of %d compared", mismatches, compared)
+		pkList := ""
+		if len(mismatchedPKs) > 0 {
+			// Limit to first 50 PKs to avoid log message being too long
+			if len(mismatchedPKs) > 50 {
+				pkList = fmt.Sprintf(" Mismatched PKs (showing first 50 of %d): %s", len(mismatchedPKs), strings.Join(mismatchedPKs[:50], ", "))
+			} else {
+				pkList = fmt.Sprintf(" Mismatched PKs: %s", strings.Join(mismatchedPKs, ", "))
+			}
+		}
+		statusMsg = fmt.Sprintf("MD5 mismatch detected, %d mismatches out of %d compared%s", mismatches, compared, pkList)
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 FAILED - MD5 mismatch detected!", mapping.MappingID)
 		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
 			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Verification failed for last %d records: %s",
