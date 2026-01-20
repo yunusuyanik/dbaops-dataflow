@@ -471,17 +471,36 @@ func processMapping(mapping TableMapping) {
 
 	updateLastConnected(mapping.FlowID)
 
-	// Check if full sync is needed
+	// Check if full sync is needed - CDC must wait for full sync to complete
 	if needsFullSync(mapping) {
 		log.Printf("[SYNC] mapping_id=%d: Full sync requested (is_full_sync=1), performing full table copy...", mapping.MappingID)
 		performFullSync(mapping, sourceDB)
-		// After full sync, refresh mapping to get updated is_full_sync value
-		// and continue with CDC if enabled
+		// After full sync, continue with CDC if enabled
 		if mapping.CDCEnabled && mapping.IsEnabled {
 			log.Printf("[SYNC] mapping_id=%d: Full sync completed, continuing with CDC sync...", mapping.MappingID)
 			processCDC(mapping, sourceDB)
 		}
 	} else if mapping.CDCEnabled && mapping.IsEnabled {
+		// Before CDC, check if full sync is requested in database
+		// CDC must wait for full sync to complete
+		var isFullSyncInDB bool
+		err := configDB.QueryRow("SELECT is_full_sync FROM table_mappings WHERE mapping_id = @p1", mapping.MappingID).Scan(&isFullSyncInDB)
+		if err != nil {
+			log.Printf("[SYNC] mapping_id=%d: Error checking is_full_sync status: %v", mapping.MappingID, err)
+			return
+		}
+		
+		if isFullSyncInDB {
+			log.Printf("[SYNC] mapping_id=%d: Full sync is requested (is_full_sync=1), CDC will wait for full sync to complete in next cycle", mapping.MappingID)
+			flow, _ := getFlowByID(mapping.FlowID)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - CDC skipped, waiting for full sync to complete",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+				"INFO", nil, nil)
+			return
+		}
+		
 		log.Printf("[SYNC] mapping_id=%d: CDC enabled, checking for CDC changes (last_lsn: %s)...", mapping.MappingID, mapping.LastCDCLSN.String)
 		processCDC(mapping, sourceDB)
 	} else {
@@ -835,9 +854,14 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		log.Printf("[FULL_SYNC] Step 12 SUCCESS: Row count verified - exported: %d, imported: %d for mapping_id=%d", exportRows, importRows, mapping.MappingID)
 	}
 
-	// Update flags
+	// Update flags and log
 	log.Printf("[FULL_SYNC] Step 13: Updating last_full_sync_at timestamp for mapping_id=%d...", mapping.MappingID)
 	updateLastFullSync(mapping.MappingID)
+	writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+		fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Full sync completed, last_full_sync_at updated",
+			flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+			mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+		"SUCCESS", nil, nil)
 
 	// Update CDC LSN after full sync (get current max LSN to continue CDC from there)
 	if mapping.CDCEnabled {
