@@ -103,100 +103,28 @@ END
 GO
 
 -- ============================================
--- SYNC STATUS TABLE
+-- LOGS TABLE
 -- ============================================
--- Sync status for each table
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'sync_status')
+-- Unified log table for all operations
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'logs')
 BEGIN
-    CREATE TABLE sync_status (
-        status_id BIGINT IDENTITY(1,1) PRIMARY KEY,
-        mapping_id INT NOT NULL,
-        sync_type NVARCHAR(50) NOT NULL,
-        status NVARCHAR(50) NOT NULL,
-        records_processed BIGINT NOT NULL DEFAULT 0,
-        records_failed BIGINT NOT NULL DEFAULT 0,
-        started_at DATETIME2 NOT NULL,
-        completed_at DATETIME2 NULL,
-        error_message NVARCHAR(MAX) NULL,
-        last_processed_pk NVARCHAR(500) NULL
-    );
-    
-    CREATE INDEX IX_sync_status_mapping ON sync_status(mapping_id, started_at DESC);
-    CREATE INDEX IX_sync_status_type ON sync_status(sync_type, status);
-END
-GO
-
--- ============================================
--- SYNC LOGS TABLE
--- ============================================
--- Detailed log for each stage
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'sync_logs')
-BEGIN
-    CREATE TABLE sync_logs (
+    CREATE TABLE logs (
         log_id BIGINT IDENTITY(1,1) PRIMARY KEY,
-        mapping_id INT NOT NULL,
-        log_level NVARCHAR(20) NOT NULL,
+        flow_id INT NULL,
+        mapping_id INT NULL,
+        log_type NVARCHAR(50) NOT NULL,
         log_message NVARCHAR(MAX) NOT NULL,
-        sync_type NVARCHAR(50) NULL,
+        status NVARCHAR(20) NOT NULL,
         records_count BIGINT NULL,
-        execution_time_ms INT NULL,
+        duration_ms INT NULL,
         created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE()
     );
     
-    CREATE INDEX IX_sync_logs_mapping ON sync_logs(mapping_id, created_at DESC);
-    CREATE INDEX IX_sync_logs_level ON sync_logs(log_level, created_at DESC);
-END
-GO
-
--- ============================================
--- ERROR LOGS TABLE
--- ============================================
--- Error logs (if one table fails, others continue)
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'error_logs')
-BEGIN
-    CREATE TABLE error_logs (
-        error_id BIGINT IDENTITY(1,1) PRIMARY KEY,
-        mapping_id INT NULL,
-        flow_id INT NULL,
-        error_type NVARCHAR(50) NOT NULL,
-        error_message NVARCHAR(MAX) NOT NULL,
-        error_details NVARCHAR(MAX) NULL,
-        stack_trace NVARCHAR(MAX) NULL,
-        retry_count INT NOT NULL DEFAULT 0,
-        is_resolved BIT NOT NULL DEFAULT 0,
-        created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
-        resolved_at DATETIME2 NULL
-    );
-    
-    CREATE INDEX IX_error_logs_mapping ON error_logs(mapping_id, created_at DESC);
-    CREATE INDEX IX_error_logs_flow ON error_logs(flow_id, created_at DESC);
-    CREATE INDEX IX_error_logs_resolved ON error_logs(is_resolved, created_at DESC);
-END
-GO
-
--- ============================================
--- VERIFICATION LOGS TABLE
--- ============================================
--- MD5 comparison results
-IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'verification_logs')
-BEGIN
-    CREATE TABLE verification_logs (
-        verification_id BIGINT IDENTITY(1,1) PRIMARY KEY,
-        mapping_id INT NOT NULL,
-        verification_type NVARCHAR(50) NOT NULL,
-        source_md5 NVARCHAR(32) NULL,
-        dest_md5 NVARCHAR(32) NULL,
-        source_row_count BIGINT NULL,
-        dest_row_count BIGINT NULL,
-        records_compared BIGINT NOT NULL DEFAULT 0,
-        mismatches_found BIGINT NOT NULL DEFAULT 0,
-        verification_status NVARCHAR(50) NOT NULL,
-        verification_details NVARCHAR(MAX) NULL,
-        verified_at DATETIME2 NOT NULL DEFAULT GETUTCDATE()
-    );
-    
-    CREATE INDEX IX_verification_logs_mapping ON verification_logs(mapping_id, verified_at DESC);
-    CREATE INDEX IX_verification_logs_status ON verification_logs(verification_status, verified_at DESC);
+    CREATE INDEX IX_logs_flow ON logs(flow_id, created_at DESC);
+    CREATE INDEX IX_logs_mapping ON logs(mapping_id, created_at DESC);
+    CREATE INDEX IX_logs_type ON logs(log_type, created_at DESC);
+    CREATE INDEX IX_logs_status ON logs(status, created_at DESC);
+    CREATE INDEX IX_logs_created ON logs(created_at DESC);
 END
 GO
 
@@ -204,30 +132,31 @@ GO
 -- HELPER VIEWS
 -- ============================================
 
--- Summary of active syncs
-IF EXISTS (SELECT * FROM sys.views WHERE name = 'v_sync_summary')
-    DROP VIEW v_sync_summary;
+-- Recent logs with flow and table mapping details
+IF EXISTS (SELECT * FROM sys.views WHERE name = 'v_recent_logs')
+    DROP VIEW v_recent_logs;
 GO
 
-CREATE VIEW v_sync_summary AS
-SELECT 
+CREATE VIEW v_recent_logs AS
+SELECT TOP 1000
+    l.log_id,
     f.flow_name,
-    f.source_server,
-    f.dest_server,
     tm.source_database,
+    tm.source_schema,
     tm.source_table,
+    tm.dest_database,
+    tm.dest_schema,
     tm.dest_table,
-    ss.status,
-    ss.sync_type,
-    ss.records_processed,
-    ss.records_failed,
-    ss.started_at,
-    ss.completed_at,
-    DATEDIFF(SECOND, ss.started_at, ISNULL(ss.completed_at, GETUTCDATE())) AS duration_seconds
-FROM sync_status ss
-INNER JOIN table_mappings tm ON ss.mapping_id = tm.mapping_id
-INNER JOIN flows f ON tm.flow_id = f.flow_id
-WHERE ss.status IN ('RUNNING', 'ERROR')
+    l.log_type,
+    l.log_message,
+    l.status,
+    l.records_count,
+    l.duration_ms,
+    l.created_at
+FROM logs l
+LEFT JOIN table_mappings tm ON l.mapping_id = tm.mapping_id
+LEFT JOIN flows f ON l.flow_id = f.flow_id OR (tm.flow_id IS NOT NULL AND l.flow_id = tm.flow_id)
+ORDER BY l.created_at DESC
 GO
 
 -- Recent errors
@@ -237,20 +166,18 @@ GO
 
 CREATE VIEW v_recent_errors AS
 SELECT TOP 100
-    el.error_id,
+    l.log_id,
     f.flow_name,
     tm.source_table,
     tm.dest_table,
-    el.error_type,
-    el.error_message,
-    el.retry_count,
-    el.is_resolved,
-    el.created_at
-FROM error_logs el
-LEFT JOIN flows f ON el.flow_id = f.flow_id
-LEFT JOIN table_mappings tm ON el.mapping_id = tm.mapping_id
-WHERE el.is_resolved = 0
-ORDER BY el.created_at DESC
+    l.log_type,
+    l.log_message,
+    l.created_at
+FROM logs l
+LEFT JOIN table_mappings tm ON l.mapping_id = tm.mapping_id
+LEFT JOIN flows f ON l.flow_id = f.flow_id OR (tm.flow_id IS NOT NULL AND l.flow_id = tm.flow_id)
+WHERE l.status = 'ERROR'
+ORDER BY l.created_at DESC
 GO
 
 PRINT 'DBAOps DataFlow schema created successfully!';

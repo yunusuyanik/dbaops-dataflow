@@ -254,7 +254,7 @@ func main() {
 
 	close(stopChan)
 	wg.Wait()
-	
+
 	configDB.Close()
 	if logFile != nil {
 		logFile.Close()
@@ -365,7 +365,7 @@ func verificationLoop() {
 						log.Printf("[VERIFICATION_LOOP] PANIC in performAllVerifications recovered: %v", r)
 					}
 				}()
-			performAllVerifications()
+				performAllVerifications()
 			}()
 
 			configMu.RLock()
@@ -421,9 +421,9 @@ func processAllMappings() {
 				processMapping(mapping)
 			}
 		}(i)
-		}
+	}
 
-		for _, mapping := range mappings {
+	for _, mapping := range mappings {
 		jobs <- mapping
 	}
 	close(jobs)
@@ -437,8 +437,12 @@ func processMapping(mapping TableMapping) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("PANIC in processMapping (mapping_id=%d) recovered: %v", mapping.MappingID, r)
-			logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
-				fmt.Sprintf("Panic recovered: %v", r), nil)
+			flow, _ := getFlowByID(mapping.FlowID)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "SYNC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Panic recovered: %v",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, r),
+				"ERROR", nil, nil)
 		}
 		syncingMu.Lock()
 		delete(syncingMappings, mapping.MappingID)
@@ -455,8 +459,12 @@ func processMapping(mapping TableMapping) {
 
 	sourceDB, err := connectToServer(mapping.SourceConnString)
 	if err != nil {
-		logError(&mapping.MappingID, &mapping.FlowID, "CONNECTION",
-			fmt.Sprintf("Failed to connect to source server: %v", err), nil)
+		flow, _ := getFlowByID(mapping.FlowID)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CONNECTION",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to connect to source server: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	defer sourceDB.Close()
@@ -558,17 +566,27 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("PANIC in performFullSync (mapping_id=%d) recovered: %v", mapping.MappingID, r)
-			logError(&mapping.MappingID, &mapping.FlowID, "FULL_SYNC",
-				fmt.Sprintf("Panic recovered: %v", r), nil)
+			flow, _ := getFlowByID(mapping.FlowID)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Panic recovered: %v",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, r),
+				"ERROR", nil, nil)
 		}
 	}()
 
-	statusID := startSyncStatus(mapping.MappingID, "FULL_SYNC", "RUNNING")
-	if statusID == 0 {
+	// Get flow details for log messages
+	flow, err := getFlowByID(mapping.FlowID)
+	if err != nil {
+		log.Printf("[FULL_SYNC] Failed to get flow details for mapping_id=%d: %v", mapping.MappingID, err)
 		return
 	}
 
-	logSync(mapping.MappingID, "INFO", "Full sync started", "FULL_SYNC", 0, 0)
+	writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+		fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Full sync started",
+			flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+			mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+		"INFO", nil, nil)
 
 	// Get and save minimum LSN before full sync (so CDC can continue from correct point after full sync)
 	if mapping.CDCEnabled {
@@ -584,21 +602,25 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 
 	if !validateSchema(mapping, sourceDB) {
 		log.Printf("[FULL_SYNC] Step 1 FAILED: Schema validation failed for mapping_id=%d", mapping.MappingID)
-		updateSyncStatus(statusID, "ERROR", 0, 0, "Schema validation failed")
-		logError(&mapping.MappingID, &mapping.FlowID, "SCHEMA", "Schema validation failed", nil)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Schema validation failed",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+			"ERROR", nil, nil)
 		return
 	}
 
 	log.Printf("[FULL_SYNC] Step 1 SUCCESS: Schema validation passed for mapping_id=%d", mapping.MappingID)
-	logSync(mapping.MappingID, "INFO", "Schema validation passed", "SCHEMA_CHECK", 0, 0)
 
 	log.Printf("[FULL_SYNC] Step 2: Connecting to destination server for mapping_id=%d...", mapping.MappingID)
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		log.Printf("[FULL_SYNC] Step 2 FAILED: Failed to connect to destination server for mapping_id=%d: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
-		logError(&mapping.MappingID, &mapping.FlowID, "CONNECTION",
-			fmt.Sprintf("Failed to connect to destination server: %v", err), nil)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to connect to destination server: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	defer destDB.Close()
@@ -608,20 +630,21 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
 		log.Printf("[FULL_SYNC] Step 3 FAILED: Failed to switch to destination database for mapping_id=%d: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
+		writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to switch to destination database: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	log.Printf("[FULL_SYNC] Step 3 SUCCESS: Switched to destination database [%s] for mapping_id=%d", mapping.DestDatabase, mapping.MappingID)
 
 	startTime := time.Now()
-	recordsProcessed := int64(0)
-	recordsFailed := int64(0)
 
 	log.Printf("[FULL_SYNC] Step 4: Getting identity columns for mapping_id=%d...", mapping.MappingID)
 	identityColumns, err := getIdentityColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	if err != nil {
 		log.Printf("[FULL_SYNC] Step 4 WARNING: Failed to get identity columns for mapping_id=%d: %v", mapping.MappingID, err)
-		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Failed to get identity columns: %v", err), "FULL_SYNC", 0, 0)
 	} else {
 		log.Printf("[FULL_SYNC] Step 4 SUCCESS: Found %d identity column(s) for mapping_id=%d", len(identityColumns), mapping.MappingID)
 	}
@@ -636,9 +659,11 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	sourceCols, err := getTableColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	if err != nil {
 		log.Printf("[FULL_SYNC] Step 5 FAILED: Failed to get source columns for mapping_id=%d: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, err.Error())
-		logError(&mapping.MappingID, &mapping.FlowID, "SYNC",
-			fmt.Sprintf("Failed to get source columns: %v", err), nil)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to get source columns: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	log.Printf("[FULL_SYNC] Step 5 SUCCESS: Found %d source column(s) for mapping_id=%d", len(sourceCols), mapping.MappingID)
@@ -660,12 +685,20 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 	if !pkFound {
-		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, fmt.Sprintf("Primary key column %s not found in source table", mapping.PrimaryKeyColumn))
+		writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Primary key column %s not found in source table",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn),
+			"ERROR", nil, nil)
 		return
 	}
 
 	if len(columns) == 0 {
-		updateSyncStatus(statusID, "ERROR", recordsProcessed, recordsFailed, "No columns to sync (all are timestamp)")
+		writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: No columns to sync (all are timestamp)",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+			"ERROR", nil, nil)
 		return
 	}
 
@@ -678,17 +711,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	log.Printf("[FULL_SYNC] Step 6: Marking mapping_id=%d as processing (setting is_full_sync=0)...", mapping.MappingID)
 	// Mark as processing immediately to prevent re-triggering
 	configDB.Exec("UPDATE table_mappings SET is_full_sync = 0 WHERE mapping_id = @p1", mapping.MappingID)
-
-	log.Printf("[FULL_SYNC] Step 7: Getting flow details (flow_id=%d) for BCP operations...", mapping.FlowID)
-	// 1. Get flow details for BCP
-	flow, err := getFlowByID(mapping.FlowID)
-	if err != nil {
-		log.Printf("[FULL_SYNC] Step 7 FAILED: Failed to get flow details for mapping_id=%d: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get flow details: %v", err))
-		return
-	}
-	log.Printf("[FULL_SYNC] Step 7 SUCCESS: Got flow details (source: %s:%d, dest: %s:%d) for mapping_id=%d",
-		flow.SourceServer, flow.SourcePort, flow.DestServer, flow.DestPort, mapping.MappingID)
 
 	// 2. Prepare temp file (no format file needed)
 	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("full_sync_%d_%d.dat", mapping.FlowID, mapping.MappingID))
@@ -703,8 +725,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	_, err = destDB.Exec(truncateQuery)
 	if err != nil {
 		log.Printf("[FULL_SYNC] Step 9 WARNING: Failed to truncate dest table for mapping_id=%d (may not exist): %v", mapping.MappingID, err)
-		logSync(mapping.MappingID, "WARNING",
-			fmt.Sprintf("Failed to truncate dest table (may not exist): %v", err), "FULL_SYNC", 0, 0)
 	} else {
 		log.Printf("[FULL_SYNC] Step 9 SUCCESS: Destination table truncated for mapping_id=%d", mapping.MappingID)
 	}
@@ -731,12 +751,19 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		if ctxOut.Err() == context.DeadlineExceeded {
 			errorMsg := "BCP export timeout after 2 hours"
 			log.Printf("[FULL_SYNC] Step 10 FAILED: %s for mapping_id=%d", errorMsg, mapping.MappingID)
-			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
-			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+				"ERROR", nil, nil)
 		} else {
+			errorMsg := fmt.Sprintf("BCP export failed: %v", err)
 			log.Printf("[FULL_SYNC] Step 10 FAILED: BCP export failed for mapping_id=%d: %v, output: %s", mapping.MappingID, err, outputOutStr)
-			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr))
-			logSync(mapping.MappingID, "ERROR", fmt.Sprintf("BCP export failed: %v, output: %s", err, outputOutStr), "FULL_SYNC", 0, 0)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+				"ERROR", nil, nil)
 		}
 		return
 	}
@@ -744,7 +771,6 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	// Parse export output for row count
 	exportRows := parseBCPRowCount(outputOutStr)
 	log.Printf("[FULL_SYNC] Step 10 SUCCESS: Export completed - %d rows exported for mapping_id=%d", exportRows, mapping.MappingID)
-	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP export completed: %d rows", exportRows), "FULL_SYNC", exportRows, 0)
 
 	// 5. Temp File to Destination (bcp in) - Native mode, no format file
 	log.Printf("[FULL_SYNC] Step 11: Starting BCP import to destination server for mapping_id=%d...", mapping.MappingID)
@@ -768,13 +794,19 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 		if ctxIn.Err() == context.DeadlineExceeded {
 			errorMsg := "BCP import timeout after 2 hours"
 			log.Printf("[FULL_SYNC] Step 11 FAILED: %s for mapping_id=%d", errorMsg, mapping.MappingID)
-			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
-			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+				"ERROR", nil, nil)
 		} else {
-			errorMsg := fmt.Sprintf("BCP import failed: %v, output: %s", err, outputInStr)
+			errorMsg := fmt.Sprintf("BCP import failed: %v", err)
 			log.Printf("[FULL_SYNC] Step 11 FAILED: BCP import failed for mapping_id=%d: %v, output: %s", mapping.MappingID, err, outputInStr)
-			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
-			logSync(mapping.MappingID, "ERROR", errorMsg, "FULL_SYNC", 0, 0)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+				"ERROR", nil, nil)
 		}
 		return
 	}
@@ -783,12 +815,15 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	importRows := parseBCPRowCount(outputInStr)
 	log.Printf("[FULL_SYNC] Step 11 SUCCESS: Import completed - %d rows imported for mapping_id=%d", importRows, mapping.MappingID)
 	log.Printf("[FULL_SYNC] Step 11: BCP import output: %s", outputInStr)
-	logSync(mapping.MappingID, "INFO", fmt.Sprintf("BCP import completed: %d rows", importRows), "FULL_SYNC", importRows, 0)
 
 	// Verify row count matches
 	if exportRows > 0 && importRows != exportRows {
 		log.Printf("[FULL_SYNC] Step 12 WARNING: Row count mismatch for mapping_id=%d! Exported: %d, Imported: %d", mapping.MappingID, exportRows, importRows)
-		logSync(mapping.MappingID, "WARNING", fmt.Sprintf("Row count mismatch: exported %d, imported %d", exportRows, importRows), "FULL_SYNC", 0, 0)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Warning: Row count mismatch, exported %d, imported %d",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, exportRows, importRows),
+			"WARNING", nil, nil)
 	} else {
 		log.Printf("[FULL_SYNC] Step 12 SUCCESS: Row count verified - exported: %d, imported: %d for mapping_id=%d", exportRows, importRows, mapping.MappingID)
 	}
@@ -810,13 +845,16 @@ func performFullSync(mapping TableMapping, sourceDB *sql.DB) {
 	}
 
 	duration := time.Since(startTime)
-	updateSyncStatus(statusID, "COMPLETED", 0, 0, "")
+	durationMs := int64(duration.Milliseconds())
+	recordsCount := importRows
 
 	log.Printf("[FULL_SYNC] COMPLETED: Full sync finished for mapping_id=%d, duration: %v, exported: %d rows, imported: %d rows",
 		mapping.MappingID, duration, exportRows, importRows)
-	logSync(mapping.MappingID, "INFO",
-		fmt.Sprintf("Full sync completed via BCP-to-BCP, duration: %v", duration),
-		"FULL_SYNC", 0, int(duration.Milliseconds()))
+	writeLog(&mapping.FlowID, &mapping.MappingID, "FULL_SYNC",
+		fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Full sync completed, %d records transferred",
+			flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+			mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, recordsCount),
+		"SUCCESS", &recordsCount, &durationMs)
 }
 
 func processCDC(mapping TableMapping, sourceDB *sql.DB) {
@@ -824,20 +862,36 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("PANIC in processCDC (mapping_id=%d) recovered: %v", mapping.MappingID, r)
-			logError(&mapping.MappingID, &mapping.FlowID, "CDC",
-				fmt.Sprintf("Panic recovered: %v", r), nil)
+			flow, _ := getFlowByID(mapping.FlowID)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Panic recovered: %v",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, r),
+				"ERROR", nil, nil)
 		}
 	}()
 
-	if !isCDCEnabled(mapping, sourceDB) {
-		logSync(mapping.MappingID, "WARNING", "CDC not enabled on source table", "CDC", 0, 0)
+	// Get flow details for log messages
+	flow, err := getFlowByID(mapping.FlowID)
+	if err != nil {
+		log.Printf("[CDC] Failed to get flow details for mapping_id=%d: %v", mapping.MappingID, err)
 		return
 	}
 
-	statusID := startSyncStatus(mapping.MappingID, "CDC", "RUNNING")
-	if statusID == 0 {
+	if !isCDCEnabled(mapping, sourceDB) {
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Warning: CDC not enabled on source table",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+			"WARNING", nil, nil)
 		return
 	}
+
+	writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+		fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - CDC sync started",
+			flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+			mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+		"INFO", nil, nil)
 
 	log.Printf("[CDC] mapping_id=%d: Step 1 - Getting last LSN...", mapping.MappingID)
 	lastLSN := mapping.LastCDCLSN.String
@@ -845,7 +899,11 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		lastLSN = getMinLSN(mapping, sourceDB)
 		if lastLSN == "" {
 			log.Printf("[CDC] mapping_id=%d: Step 1 WARNING - No CDC data available", mapping.MappingID)
-			updateSyncStatus(statusID, "COMPLETED", 0, 0, "No CDC data available")
+			writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - CDC sync completed, no changes found",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+				"SUCCESS", nil, nil)
 			return
 		}
 		// Save initial LSN so we don't keep starting from the same point
@@ -858,15 +916,21 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 	changes, err := getCDCChanges(mapping, sourceDB, lastLSN)
 	if err != nil {
 		log.Printf("[CDC] mapping_id=%d: Step 2 FAILED - Failed to get CDC changes: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
-		logError(&mapping.MappingID, &mapping.FlowID, "CDC",
-			fmt.Sprintf("Failed to get CDC changes: %v", err), nil)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to get CDC changes: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 
 	if len(changes) == 0 {
 		log.Printf("[CDC] mapping_id=%d: Step 2 SUCCESS - No changes found, CDC sync completed", mapping.MappingID)
-		updateSyncStatus(statusID, "COMPLETED", 0, 0, "")
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - CDC sync completed, no changes found",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+			"SUCCESS", nil, nil)
 		return
 	}
 	log.Printf("[CDC] mapping_id=%d: Step 2 SUCCESS - Found %d CDC changes", mapping.MappingID, len(changes))
@@ -905,51 +969,61 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 
 	if len(pkValues) == 0 {
 		log.Printf("[CDC] mapping_id=%d: Step 3 WARNING - No primary key values found in CDC changes", mapping.MappingID)
-		updateSyncStatus(statusID, "COMPLETED", 0, 0, "No primary key values found")
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - CDC sync completed, no primary key values found",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+			"SUCCESS", nil, nil)
 		return
 	}
 	log.Printf("[CDC] mapping_id=%d: Step 3 SUCCESS - Extracted %d primary key values, max LSN: %s", mapping.MappingID, len(pkValues), maxLSN)
 
-	// Step 4: Get flow details for BCP
-	log.Printf("[CDC] mapping_id=%d: Step 4 - Getting flow details (flow_id=%d) for BCP operations...", mapping.MappingID, mapping.FlowID)
-	flow, err := getFlowByID(mapping.FlowID)
-	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 4 FAILED - Failed to get flow details: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get flow details: %v", err))
-		return
-	}
-	log.Printf("[CDC] mapping_id=%d: Step 4 SUCCESS - Got flow details", mapping.MappingID)
-
-	// Step 5: Get destination columns first (to match column order for BCP native mode)
-	log.Printf("[CDC] mapping_id=%d: Step 5 - Connecting to destination and getting table columns for correct order...", mapping.MappingID)
+	// Step 4: Get destination columns first (to match column order for BCP native mode)
+	log.Printf("[CDC] mapping_id=%d: Step 4 - Connecting to destination and getting table columns for correct order...", mapping.MappingID)
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Failed to connect to destination: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
+		log.Printf("[CDC] mapping_id=%d: Step 4 FAILED - Failed to connect to destination: %v", mapping.MappingID, err)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to connect to destination: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	defer destDB.Close()
 
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Failed to switch to destination database: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, err.Error())
+		log.Printf("[CDC] mapping_id=%d: Step 4 FAILED - Failed to switch to destination database: %v", mapping.MappingID, err)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to switch to destination database: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 
 	// Get destination columns first (for BCP native mode, column order must match destination)
 	destCols, err := getTableColumns(destDB, mapping.DestDatabase, mapping.DestSchema, mapping.DestTable)
 	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Failed to get destination columns: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get destination columns: %v", err))
+		log.Printf("[CDC] mapping_id=%d: Step 4 FAILED - Failed to get destination columns: %v", mapping.MappingID, err)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to get destination columns: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 
 	// Get source columns
 	sourceCols, err := getTableColumns(sourceDB, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
 	if err != nil {
-		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Failed to get source columns: %v", mapping.MappingID, err)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to get source columns: %v", err))
+		log.Printf("[CDC] mapping_id=%d: Step 4 FAILED - Failed to get source columns: %v", mapping.MappingID, err)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to get source columns: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 
@@ -971,8 +1045,12 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		pkFound = true
 	}
 	if !pkFound {
-		log.Printf("[CDC] mapping_id=%d: Step 5 FAILED - Primary key column %s not found in source table", mapping.MappingID, mapping.PrimaryKeyColumn)
-		updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Primary key column %s not found in source table", mapping.PrimaryKeyColumn))
+		log.Printf("[CDC] mapping_id=%d: Step 4 FAILED - Primary key column %s not found in source table", mapping.MappingID, mapping.PrimaryKeyColumn)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Primary key column %s not found in source table",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, mapping.PrimaryKeyColumn),
+			"ERROR", nil, nil)
 		return
 	}
 
@@ -987,18 +1065,15 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	log.Printf("[CDC] mapping_id=%d: Step 5 SUCCESS - Found %d columns to sync (all columns included, no exclusions)",
+	log.Printf("[CDC] mapping_id=%d: Step 4 SUCCESS - Found %d columns to sync (all columns included, no exclusions)",
 		mapping.MappingID, len(columns))
 
-	// Step 6: Process PKs in batches to avoid "argument list too long" error
+	// Step 5: Process PKs in batches to avoid "argument list too long" error
 	// Split PKs into batches of 1000 to avoid command line length limits
 	batchSizePK := 1000
 	totalBatches := (len(pkValues) + batchSizePK - 1) / batchSizePK
-	log.Printf("[CDC] mapping_id=%d: Step 6 - Processing %d primary keys in %d batches (batch size: %d)...",
+	log.Printf("[CDC] mapping_id=%d: Step 5 - Processing %d primary keys in %d batches (batch size: %d)...",
 		mapping.MappingID, len(pkValues), totalBatches, batchSizePK)
-
-	// Step 7: Destination already connected in Step 5
-	log.Printf("[CDC] mapping_id=%d: Step 7 SUCCESS - Destination connection ready (connected in Step 5)", mapping.MappingID)
 
 	configMu.RLock()
 	batchSizeVal := batchSize
@@ -1039,7 +1114,11 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 		if err != nil {
 			log.Printf("[CDC] mapping_id=%d: Step 8b FAILED - Failed to delete from destination (batch %d): %v",
 				mapping.MappingID, batchNum+1, err)
-			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("Failed to delete from destination (batch %d): %v", batchNum+1, err))
+			writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to delete from destination (batch %d): %v",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, batchNum+1, err),
+				"ERROR", nil, nil)
 			return
 		}
 		rowsAffected, _ := result.RowsAffected()
@@ -1081,12 +1160,21 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			if ctxOut.Err() == context.DeadlineExceeded {
 				errorMsg := fmt.Sprintf("BCP export timeout for batch %d", batchNum+1)
 				log.Printf("[CDC] mapping_id=%d: Step 8c FAILED - %s", mapping.MappingID, errorMsg)
-				updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+				writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+					fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+						flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+						mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+					"ERROR", nil, nil)
 				return
 			}
+			errorMsg := fmt.Sprintf("BCP export failed for batch %d: %v", batchNum+1, err)
 			log.Printf("[CDC] mapping_id=%d: Step 8c FAILED - BCP export failed for batch %d: %v, output: %s",
 				mapping.MappingID, batchNum+1, err, outputOutStr)
-			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP export failed for batch %d: %v", batchNum+1, err))
+			writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+				"ERROR", nil, nil)
 			return
 		}
 		batchExportRows := parseBCPRowCount(outputOutStr)
@@ -1124,22 +1212,35 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			if ctxIn.Err() == context.DeadlineExceeded {
 				errorMsg := fmt.Sprintf("BCP import timeout for batch %d", batchNum+1)
 				log.Printf("[CDC] mapping_id=%d: Step 8d FAILED - %s", mapping.MappingID, errorMsg)
-				updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+				writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+					fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+						flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+						mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+					"ERROR", nil, nil)
 				return
 			}
+			errorMsg := fmt.Sprintf("BCP import failed for batch %d: %v", batchNum+1, err)
 			log.Printf("[CDC] mapping_id=%d: Step 8d FAILED - BCP import failed for batch %d: %v, output: %s",
 				mapping.MappingID, batchNum+1, err, outputInStr)
-			updateSyncStatus(statusID, "ERROR", 0, 0, fmt.Sprintf("BCP import failed for batch %d: %v, output: %s", batchNum+1, err, outputInStr))
+			writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+				"ERROR", nil, nil)
 			return
 		}
 		batchImportRows := parseBCPRowCount(outputInStr)
 		totalImportRows += batchImportRows
 		if batchImportRows == 0 && batchExportRows > 0 {
 			// This is a critical error - we exported rows but imported 0
-			errorMsg := fmt.Sprintf("BCP import returned 0 rows but export had %d rows (batch %d/%d). This indicates a column order/type mismatch. Output: %s",
-				batchExportRows, batchNum+1, totalBatches, outputInStr)
+			errorMsg := fmt.Sprintf("BCP import returned 0 rows but export had %d rows (batch %d/%d). This indicates a column order/type mismatch",
+				batchExportRows, batchNum+1, totalBatches)
 			log.Printf("[CDC] mapping_id=%d: Step 8d ERROR - %s", mapping.MappingID, errorMsg)
-			updateSyncStatus(statusID, "ERROR", 0, 0, errorMsg)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: %s",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, errorMsg),
+				"ERROR", nil, nil)
 			return
 		}
 		if batchImportRows == 0 {
@@ -1150,27 +1251,34 @@ func processCDC(mapping TableMapping, sourceDB *sql.DB) {
 			mapping.MappingID, batchImportRows, batchNum+1, totalBatches)
 	}
 
-	log.Printf("[CDC] mapping_id=%d: Step 8 SUCCESS - Processed all batches: %d exported, %d deleted, %d imported",
+	log.Printf("[CDC] mapping_id=%d: Step 6 SUCCESS - Processed all batches: %d exported, %d deleted, %d imported",
 		mapping.MappingID, totalExportRows, totalDeleteRows, totalImportRows)
 
-	// Step 10: Update last LSN and sync timestamp
+	// Step 7: Update last LSN and sync timestamp
 	if maxLSN != "" {
-		log.Printf("[CDC] mapping_id=%d: Step 10 - Updating last LSN to: %s", mapping.MappingID, maxLSN)
+		log.Printf("[CDC] mapping_id=%d: Step 7 - Updating last LSN to: %s", mapping.MappingID, maxLSN)
 		updateLastLSN(mapping.MappingID, maxLSN)
-		log.Printf("[CDC] mapping_id=%d: Step 10 SUCCESS - Updated last LSN", mapping.MappingID)
+		log.Printf("[CDC] mapping_id=%d: Step 7 SUCCESS - Updated last LSN", mapping.MappingID)
 	}
 
 	recordsProcessed := totalImportRows
-	recordsExported := totalExportRows
-	recordsDeleted := totalDeleteRows
-
-	updateSyncStatus(statusID, "COMPLETED", recordsProcessed, 0, "")
 
 	log.Printf("[CDC] mapping_id=%d: COMPLETED - CDC sync finished: exported=%d, deleted=%d, imported=%d rows",
-		mapping.MappingID, recordsExported, recordsDeleted, recordsProcessed)
-		logSync(mapping.MappingID, "INFO", 
-		fmt.Sprintf("CDC sync completed: exported=%d, deleted=%d, imported=%d rows", recordsExported, recordsDeleted, recordsProcessed),
-			"CDC", recordsProcessed, 0)
+		mapping.MappingID, totalExportRows, totalDeleteRows, recordsProcessed)
+	
+	if recordsProcessed > 0 {
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - CDC sync completed, %d records transferred",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, recordsProcessed),
+			"SUCCESS", &recordsProcessed, nil)
+	} else {
+		writeLog(&mapping.FlowID, &mapping.MappingID, "CDC",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - CDC sync completed, no changes found",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable),
+			"SUCCESS", nil, nil)
+	}
 }
 
 func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
@@ -1244,7 +1352,7 @@ func validateSchema(mapping TableMapping, sourceDB *sql.DB) bool {
 	sourceColMap := make(map[string]bool)
 	for _, col := range sourceCols {
 		if !excludeMap[strings.ToLower(col)] {
-		sourceColMap[strings.ToLower(col)] = true
+			sourceColMap[strings.ToLower(col)] = true
 		}
 	}
 
@@ -1563,7 +1671,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1592,7 +1700,7 @@ func getMinLSN(mapping TableMapping, db *sql.DB) string {
 		}
 		return ""
 	}
-	
+
 	return hex.EncodeToString(lsn)
 }
 
@@ -1645,7 +1753,7 @@ func getCDCChanges(mapping TableMapping, db *sql.DB, lastLSN string) ([]map[stri
 		INNER JOIN sys.tables t ON t.object_id = ct.object_id
 		WHERE ct.source_object_id = OBJECT_ID('[%s].[%s].[%s]')
 	`, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable)
-	
+
 	var cdcTableName sql.NullString
 	err := db.QueryRow(query).Scan(&cdcTableName)
 	if err != nil {
@@ -1709,16 +1817,31 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[VERIFICATION] PANIC in performVerification (mapping_id=%d) recovered: %v", mapping.MappingID, r)
-			logError(&mapping.MappingID, nil, "VERIFICATION",
-				fmt.Sprintf("Panic recovered: %v", r), nil)
+			flow, _ := getFlowByID(mapping.FlowID)
+			writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
+				fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Panic recovered: %v",
+					flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+					mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, r),
+				"ERROR", nil, nil)
 		}
 	}()
+
+	// Get flow details for log messages
+	flow, err := getFlowByID(mapping.FlowID)
+	if err != nil {
+		log.Printf("[VERIFICATION] Failed to get flow details for mapping_id=%d: %v", mapping.MappingID, err)
+		return
+	}
 
 	log.Printf("[VERIFICATION] mapping_id=%d: Step 1 - Connecting to destination server...", mapping.MappingID)
 	destDB, err := connectToServer(mapping.DestConnString)
 	if err != nil {
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 1 FAILED - Failed to connect to destination: %v", mapping.MappingID, err)
-		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to connect to destination: %v", err), nil)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to connect to destination: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	defer destDB.Close()
@@ -1728,7 +1851,11 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	_, err = destDB.Exec(fmt.Sprintf("USE [%s]", mapping.DestDatabase))
 	if err != nil {
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 2 FAILED - Failed to switch to destination database: %v", mapping.MappingID, err)
-		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to switch to destination database: %v", err), nil)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to switch to destination database: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	log.Printf("[VERIFICATION] mapping_id=%d: Step 2 SUCCESS - Switched to destination database", mapping.MappingID)
@@ -1801,7 +1928,11 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 	destRows, err := destDB.Query(destQuery)
 	if err != nil {
 		log.Printf("[VERIFICATION] mapping_id=%d: Step 3 FAILED - Failed to query destination: %v", mapping.MappingID, err)
-		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query dest: %v", err), nil)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to query destination: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	defer destRows.Close()
@@ -1894,8 +2025,12 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 
 	sourceRows, err := sourceDB.Query(sourceQuery)
 	if err != nil {
-		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 FAILED - Failed to query source: %v", mapping.MappingID, err)
-		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("Failed to query source: %v", err), nil)
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 5 FAILED - Failed to query source: %v", mapping.MappingID, err)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Error: Failed to query source: %v",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, err),
+			"ERROR", nil, nil)
 		return
 	}
 	defer sourceRows.Close()
@@ -1968,24 +2103,28 @@ func performVerification(mapping TableMapping, sourceDB *sql.DB) {
 		}
 	}
 
-	status := "PASSED"
+	configMu.RLock()
+	rowCount := verificationRowCount
+	configMu.RUnlock()
+
+	status := "SUCCESS"
+	statusMsg := "MD5 hashes match"
 	if destCombinedMD5 != sourceCombinedMD5 {
 		status = "FAILED"
-		log.Printf("[VERIFICATION] mapping_id=%d: Step 7 FAILED - MD5 mismatch detected!", mapping.MappingID)
-		configMu.RLock()
-		rowCount := verificationRowCount
-		configMu.RUnlock()
-		logError(&mapping.MappingID, nil, "VERIFICATION", fmt.Sprintf("MD5 mismatch detected between source and destination for last %d rows", rowCount), nil)
+		statusMsg = fmt.Sprintf("MD5 mismatch detected, %d mismatches out of %d compared", mismatches, compared)
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 FAILED - MD5 mismatch detected!", mapping.MappingID)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Verification failed for last %d records: %s",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, rowCount, statusMsg),
+			"FAILED", &compared, nil)
 	} else {
-		log.Printf("[VERIFICATION] mapping_id=%d: Step 7 SUCCESS - MD5 hashes match.", mapping.MappingID)
-	}
-
-	logVerification(mapping.MappingID, "MD5_COMPARISON", sourceCombinedMD5, destCombinedMD5,
-		int64(len(destData)), int64(len(sourceData)), compared, mismatches, status, "")
-
-	if mismatches > 0 {
-		logError(&mapping.MappingID, nil, "VERIFICATION", 
-			fmt.Sprintf("MD5 verification failed: %d mismatches out of %d compared", mismatches, compared), nil)
+		log.Printf("[VERIFICATION] mapping_id=%d: Step 6 SUCCESS - MD5 hashes match.", mapping.MappingID)
+		writeLog(&mapping.FlowID, &mapping.MappingID, "VERIFICATION",
+			fmt.Sprintf("Flow '%s': Table mapping '%s' (%s.%s.%s -> %s.%s.%s) - Verification completed for last %d records: MD5 hashes match",
+				flow.FlowName, mapping.SourceTable, mapping.SourceDatabase, mapping.SourceSchema, mapping.SourceTable,
+				mapping.DestDatabase, mapping.DestSchema, mapping.DestTable, rowCount),
+			"SUCCESS", &compared, nil)
 	}
 }
 
@@ -2136,36 +2275,30 @@ func updateLastConnected(flowID int) {
 	configDB.Exec("UPDATE flows SET last_connected_at = GETUTCDATE() WHERE flow_id = @p1", flowID)
 }
 
-func startSyncStatus(mappingID int, syncType, status string) int64 {
-	var statusID int64
-	err := configDB.QueryRow(`
-		INSERT INTO sync_status (mapping_id, sync_type, status, records_processed, records_failed, started_at)
-		OUTPUT INSERTED.status_id
-		VALUES (@p1, @p2, @p3, 0, 0, GETUTCDATE())
-	`, mappingID, syncType, status).Scan(&statusID)
-	
-	if err != nil {
-		log.Printf("Failed to create sync status: %v", err)
-		return 0
-	}
-	return statusID
-}
+// writeLog writes a unified log entry to the logs table
+func writeLog(flowID *int, mappingID *int, logType, logMessage, status string, recordsCount *int64, durationMs *int) {
+	var flowIDVal interface{}
+	var mappingIDVal interface{}
+	var recordsCountVal interface{}
+	var durationMsVal interface{}
 
-func updateSyncStatus(statusID int64, status string, processed, failed int64, errorMsg string) {
-	if errorMsg != "" {
-		configDB.Exec(`
-			UPDATE sync_status 
-			SET status = @p1, records_processed = @p2, records_failed = @p3, 
-			    completed_at = GETUTCDATE(), error_message = @p4
-			WHERE status_id = @p5
-		`, status, processed, failed, errorMsg, statusID)
-	} else {
-		configDB.Exec(`
-			UPDATE sync_status 
-			SET status = @p1, records_processed = @p2, records_failed = @p3, completed_at = GETUTCDATE()
-			WHERE status_id = @p4
-		`, status, processed, failed, statusID)
+	if flowID != nil {
+		flowIDVal = *flowID
 	}
+	if mappingID != nil {
+		mappingIDVal = *mappingID
+	}
+	if recordsCount != nil {
+		recordsCountVal = *recordsCount
+	}
+	if durationMs != nil {
+		durationMsVal = *durationMs
+	}
+
+	configDB.Exec(`
+		INSERT INTO logs (flow_id, mapping_id, log_type, log_message, status, records_count, duration_ms)
+		VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7)
+	`, flowIDVal, mappingIDVal, logType, logMessage, status, recordsCountVal, durationMsVal)
 }
 
 func getFlowByID(flowID int) (Flow, error) {
@@ -2179,9 +2312,6 @@ func getFlowByID(flowID int) (Flow, error) {
 	return f, err
 }
 
-func updateLastProcessedPK(statusID int64, pkValue string) {
-	configDB.Exec("UPDATE sync_status SET last_processed_pk = @p1 WHERE status_id = @p2", pkValue, statusID)
-}
 
 func updateLastLSN(mappingID int, lsn string) {
 	// Convert hex string to binary
@@ -2357,34 +2487,6 @@ func updateLastFullSync(mappingID int) {
 	configDB.Exec("UPDATE table_mappings SET last_full_sync_at = GETUTCDATE() WHERE mapping_id = @p1", mappingID)
 }
 
-func logSync(mappingID int, level, message, syncType string, recordsCount int64, execTimeMs int) {
-	configDB.Exec(`
-		INSERT INTO sync_logs (mapping_id, log_level, log_message, sync_type, records_count, execution_time_ms)
-		VALUES (@p1, @p2, @p3, @p4, @p5, @p6)
-	`, mappingID, level, message, syncType, recordsCount, execTimeMs)
-}
-
-func logError(mappingID *int, flowID *int, errorType, message string, details interface{}) {
-	var detailsStr string
-	if details != nil {
-		detailsStr = fmt.Sprintf("%v", details)
-	}
-
-	configDB.Exec(`
-		INSERT INTO error_logs (mapping_id, flow_id, error_type, error_message, error_details)
-		VALUES (@p1, @p2, @p3, @p4, @p5)
-	`, mappingID, flowID, errorType, message, detailsStr)
-}
-
-func logVerification(mappingID int, vType, sourceMD5, destMD5 string, 
-	sourceCount, destCount, compared, mismatches int64, status, details string) {
-	configDB.Exec(`
-		INSERT INTO verification_logs 
-		(mapping_id, verification_type, source_md5, dest_md5, source_row_count, dest_row_count,
-		 records_compared, mismatches_found, verification_status, verification_details)
-		VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10)
-	`, mappingID, vType, sourceMD5, destMD5, sourceCount, destCount, compared, mismatches, status, details)
-}
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
